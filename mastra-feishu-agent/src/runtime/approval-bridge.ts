@@ -1,7 +1,7 @@
 import { isAuthorizedCaller, type Caller } from '../identity';
 import { actionSummary, type OfficeAction } from '../office/actions';
 import { proposeAction } from '../state/approvals';
-import { stateDb } from '../state/store';
+import { isMessageRecalled, stateDb } from '../state/store';
 import { sendStudioApprovalCard } from './office-bridge';
 import { config } from '../config';
 
@@ -19,7 +19,9 @@ export async function requestOfficeApproval(caller: Caller, action: OfficeAction
   }
   const proposal = await proposeAction(caller, action);
   try {
+    if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮操作已取消');
     await (notifier ?? sendStudioApprovalCard)(caller.chatId, proposal.id, actionSummary(action));
+    if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮操作已取消');
   } catch (error) {
     const db = await stateDb();
     await db.execute({ sql: "UPDATE actions SET status = 'failed', result = ? WHERE id = ? AND status = 'pending'", args: [String(error), proposal.id] });

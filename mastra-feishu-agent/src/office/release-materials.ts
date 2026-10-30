@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { config } from '../config';
 import type { Caller } from '../identity';
-import { stateDb } from '../state/store';
+import { isMessageRecalled, stateDb } from '../state/store';
 import type { OfficeApi } from './client';
 
 const token = z.string().min(1).max(256).regex(/^[\w@.-]+$/);
@@ -12,29 +12,34 @@ export const releaseInput = z.object({
   materialsParentUrl: z.string().url(),
   releaseId: z.string().trim().min(1).max(100).regex(/^[^\\/<>:"|?*\x00-\x1f]+$/),
   fields: z.record(fieldName, z.string().max(20_000).refine(v => !v.includes('{{') && !v.includes('}}'), '字段值不能包含占位符标记')),
+  sheetScopes: z.array(z.object({ fileName: z.string().min(1), sheetName: z.string().min(1), range: z.string().regex(/^[A-Z]+[1-9]\d*:[A-Z]+[1-9]\d*$/) })).max(100).optional(),
 });
 export type ReleaseInput = z.infer<typeof releaseInput>;
 export type ReleaseType = 'docx' | 'sheet' | 'bitable';
 export type DriveFile = { token: string; name: string; type: ReleaseType | 'folder' | string; url?: string; modified_time?: string };
-type Patch = { location: string; field: string; before: string; after: string; blockId?: string; elements?: unknown[]; title?: boolean; fileName?: boolean; sheetId?: string; cell?: string; tableId?: string; recordId?: string; fieldName?: string };
+type Patch = { location: string; field: string; before: string; after: string; blockId?: string; elements?: unknown[]; title?: boolean; fileName?: boolean; sheetId?: string; cell?: string; mergeRange?: string; tableId?: string; recordId?: string; fieldName?: string };
 type ScannedFile = DriveFile & { patches: Patch[]; fingerprint: string };
 type ScanResult = { patches: Patch[]; fingerprint: string };
-export type ReleaseManifest = { input: ReleaseInput; templateFolderToken: string; materialsParentToken: string; files: ScannedFile[]; ignoredFolders: string[] };
+export type ReleaseManifest = { input: ReleaseInput; templateFolderToken: string; materialsParentToken: string; files: ScannedFile[]; ignoredFolders: string[]; unusedFields?: string[] };
 const marker = /\{\{([^{}]+)\}\}/g;
 const enc = encodeURIComponent;
 
 export function parseDriveFolderUrl(value: string): string {
   const url = new URL(value);
-  if (url.protocol !== 'https:' || !config.documentHosts.includes(url.hostname.toLowerCase())) throw new Error('请提供已配置飞书域名的 HTTPS 文件夹链接');
+  if (url.protocol !== 'https:') throw new Error('请提供 HTTPS 飞书文件夹链接');
+  if (!config.documentHosts.includes(url.hostname.toLowerCase())) throw new Error(`文件夹链接域名 ${url.hostname} 不在 FEISHU_DOCUMENT_HOSTS 中；请将客户端分享链接的域名加入配置`);
   const match = /^\/drive\/folder\/([\w@.-]+)\/?$/.exec(url.pathname);
   if (!match) throw new Error('仅支持普通云空间 /drive/folder/ 文件夹链接，不支持 Wiki 目录');
   return token.parse(match[1]);
 }
 
-function replacement(before: string, fields: Record<string, string>, used: Set<string>): string {
-  return before.replace(marker, (_whole, raw: string) => {
+function replacement(before: string, fields: Record<string, string>, used: Set<string>, preserveUnknown = false): string {
+  return before.replace(marker, (whole, raw: string) => {
     const name = raw.trim();
-    if (!Object.hasOwn(fields, name)) throw new Error(`模板需要字段“${name}”，请补充后重新发起`);
+    if (!Object.hasOwn(fields, name)) {
+      if (preserveUnknown) return whole;
+      throw new Error(`模板需要字段“${name}”，请补充后重新发起`);
+    }
     used.add(name);
     return fields[name];
   });
@@ -42,6 +47,23 @@ function replacement(before: string, fields: Record<string, string>, used: Set<s
 function containsMarker(value: unknown): boolean { return (JSON.stringify(value) ?? '').includes('{{'); }
 function same(a: unknown, b: unknown): boolean { return JSON.stringify(a) === JSON.stringify(b); }
 function column(index: number): string { let out = ''; for (let n = index + 1; n > 0; n = Math.floor((n - 1) / 26)) out = String.fromCharCode(65 + (n - 1) % 26) + out; return out; }
+function columnIndex(label: string): number { return [...label].reduce((n, char) => n * 26 + char.charCodeAt(0) - 64, 0) - 1; }
+type SheetScope = NonNullable<ReleaseInput['sheetScopes']>[number];
+type Merge = { start_row_index?: number; end_row_index?: number; start_column_index?: number; end_column_index?: number };
+type Sheet = { sheet_id?: string; title?: string; grid_properties?: { row_count?: number; column_count?: number }; merges?: Merge[] };
+function mergeAt(sheet: Sheet, row: number, col: number): { anchor: string; range: string } | undefined {
+  for (const merge of sheet.merges ?? []) {
+    const { start_row_index: r0, end_row_index: r1, start_column_index: c0, end_column_index: c1 } = merge;
+    // Sheets query reports both end indexes inclusively. A one-cell range
+    // therefore has identical start and end indexes.
+    if (![r0, r1, c0, c1].every(n => Number.isInteger(n)) || r0! < 0 || c0! < 0 || r1! < r0! || c1! < c0!) throw new Error(`${sheet.title ?? sheet.sheet_id} 的合并区域元数据无效`);
+    if (row >= r0! && row <= r1! && col >= c0! && col <= c1!) {
+      const anchor = `${column(c0!)}${r0! + 1}`;
+      return { anchor, range: `${anchor}:${column(c1!)}${r1! + 1}` };
+    }
+  }
+  return undefined;
+}
 
 export class ReleaseMaterialsService {
   constructor(private readonly api: OfficeApi) {}
@@ -141,34 +163,70 @@ export class ReleaseMaterialsService {
     return { patches, fingerprint: hash.digest('hex') };
   }
 
-  private async scanSheet(file: DriveFile, fields: Record<string, string>, used: Set<string>): Promise<ScanResult> {
+  private async scanSheet(file: DriveFile, fields: Record<string, string>, used: Set<string>, scopes: SheetScope[] = []): Promise<ScanResult> {
     const data = await this.api.call({ method: 'GET', url: `/open-apis/sheets/v3/spreadsheets/${enc(file.token)}/sheets/query` });
     const hash = createHash('sha256');
-    const sheets = (data.sheets as Array<{ sheet_id?: string; title?: string; grid_properties?: { row_count?: number; column_count?: number } }> | undefined) ?? [];
+    const sheets = (data.sheets as Sheet[] | undefined) ?? [];
     hash.update(JSON.stringify(sheets));
     const patches: Patch[] = [];
+    const fileScopes = scopes.filter(scope => scope.fileName === file.name);
+    const matchedScopes = new Set<string>();
     for (const sheet of sheets) {
       if (!sheet.sheet_id) throw new Error(`${file.name} 有工作表缺少 sheet_id`);
+      const scope = fileScopes.find(item => item.sheetName === sheet.title);
+      if (fileScopes.length && !scope) continue;
+      if (scope) {
+        if (matchedScopes.has(scope.sheetName) || fileScopes.filter(item => item.sheetName === scope.sheetName).length !== 1) throw new Error(`${file.name} 的 ${scope.sheetName} 扫描范围重复`);
+        matchedScopes.add(scope.sheetName);
+      }
       const rows = sheet.grid_properties?.row_count;
       const cols = sheet.grid_properties?.column_count;
       if (rows === undefined || cols === undefined) throw new Error(`${file.name} 的工作表缺少行列范围，无法安全完整扫描`);
-      if (rows > 10000 || cols > 256 || rows < 0 || cols < 0) throw new Error(`${file.name} 的工作表范围过大或无法确定，无法安全完整扫描`);
-      if (!rows || !cols) continue;
-      for (let start = 1; start <= rows; start += 200) {
-        const end = Math.min(start + 199, rows);
-        const range = `${sheet.sheet_id}!A${start}:${column(cols - 1)}${end}`;
-        const values = await this.api.call({ method: 'GET', url: `/open-apis/sheets/v2/spreadsheets/${enc(file.token)}/values/${enc(range)}`, params: { valueRenderOption: 'Formula' } });
+      if (!Number.isSafeInteger(rows) || !Number.isSafeInteger(cols) || rows < 0 || cols < 0) throw new Error(`${file.name} 的工作表范围无效，无法安全扫描`);
+      if (!rows || !cols) {
+        if (scope) throw new Error(`${file.name} ${sheet.title} 是空工作表，不能使用扫描范围 ${scope.range}`);
+        continue;
+      }
+      let firstRow = 1, lastRow = rows, firstCol = 0, lastCol = cols - 1;
+      if (scope) {
+        const parts = /^([A-Z]+)([1-9]\d*):([A-Z]+)([1-9]\d*)$/.exec(scope.range)!;
+        firstCol = columnIndex(parts[1]); firstRow = Number(parts[2]); lastCol = columnIndex(parts[3]); lastRow = Number(parts[4]);
+        if (firstCol > lastCol || firstRow > lastRow || lastCol >= cols || lastRow > rows) throw new Error(`${file.name} ${sheet.title} 扫描范围 ${scope.range} 超出工作表`);
+      } else if (rows * cols > 100_000) {
+        throw new Error(`${file.name} / ${sheet.title ?? sheet.sheet_id} 扫描范围过大（${rows}×${cols}）；请指定 sheetScopes 中的 fileName、sheetName 和 range`);
+      }
+      const width = lastCol - firstCol + 1;
+      if (width > 1000 || (lastRow - firstRow + 1) * width > 100_000) throw new Error(`${file.name} / ${sheet.title ?? sheet.sheet_id} 扫描范围过大；请缩小 sheetScopes 的 range`);
+      const rowsPerRead = Math.max(1, Math.floor(1000 / width));
+      for (let start = firstRow; start <= lastRow; start += rowsPerRead) {
+        const end = Math.min(start + rowsPerRead - 1, lastRow);
+        const range = `${token.parse(sheet.sheet_id)}!${column(firstCol)}${start}:${column(lastCol)}${end}`;
+        let values: Record<string, unknown>;
+        try {
+          values = await this.api.call({ method: 'GET', url: `/open-apis/sheets/v2/spreadsheets/${enc(file.token)}/values/${range}`, params: { valueRenderOption: 'Formula' } });
+        } catch (error) {
+          throw new Error(`${file.name} / ${sheet.title ?? sheet.sheet_id} / ${range} 读取失败：${String(error)}`);
+        }
         const matrix = (values.valueRange as { values?: unknown[][] } | undefined)?.values ?? [];
         hash.update(JSON.stringify(matrix));
         for (let r = 0; r < matrix.length; r++) for (let c = 0; c < matrix[r].length; c++) {
           const cell = matrix[r][c];
           if (!containsMarker(cell)) continue;
-          if (typeof cell !== 'string' || !/^\{\{[^{}]+\}\}$/.test(cell)) throw new Error(`${file.name} ${sheet.title ?? sheet.sheet_id}!${column(c)}${start + r} 含公式、混合文本或不支持的占位符`);
-          const after = replacement(cell, fields, used);
-          patches.push({ location: `${sheet.title ?? sheet.sheet_id}!${column(c)}${start + r}`, field: cell.slice(2, -2).trim(), before: cell, after, sheetId: sheet.sheet_id, cell: `${column(c)}${start + r}` });
+          const matchedField = [...(JSON.stringify(cell) ?? '').matchAll(marker)]
+            .some(([, raw]) => Object.hasOwn(fields, raw.trim()));
+          if (!matchedField) continue;
+          const actualCol = firstCol + c;
+          if (typeof cell !== 'string' || cell.trimStart().startsWith('=')) throw new Error(`${file.name} ${sheet.title ?? sheet.sheet_id}!${column(actualCol)}${start + r} 含公式或非普通文本占位符`);
+          const cellRef = `${column(actualCol)}${start + r}`;
+          const merge = mergeAt(sheet, start + r - 1, actualCol);
+          if (merge && merge.anchor !== cellRef) throw new Error(`${file.name} ${sheet.title ?? sheet.sheet_id}!${cellRef} 位于合并区域 ${merge.range} 的非左上角，无法安全替换`);
+          const after = replacement(cell, fields, used, true);
+          const matchedNames = [...new Set([...cell.matchAll(marker)].map(([, raw]) => raw.trim()).filter(name => Object.hasOwn(fields, name)))];
+          patches.push({ location: `${sheet.title ?? sheet.sheet_id}!${merge?.range ?? cellRef}`, field: matchedNames.join('、'), before: cell, after, sheetId: sheet.sheet_id, cell: cellRef, ...(merge ? { mergeRange: merge.range } : {}) });
         }
       }
     }
+    if (matchedScopes.size !== fileScopes.length) throw new Error(`${file.name} 的 sheetScopes 含不存在的工作表`);
     return { patches, fingerprint: hash.digest('hex') };
   }
 
@@ -215,11 +273,16 @@ export class ReleaseMaterialsService {
     return { patches, fingerprint: hash.digest('hex') };
   }
 
-  async scanFile(file: DriveFile, fields: Record<string, string>, used = new Set<string>()): Promise<ScannedFile> {
-    const scan = file.type === 'docx' ? await this.scanDocx(file, fields, used)
-      : file.type === 'sheet' ? await this.scanSheet(file, fields, used)
-      : file.type === 'bitable' ? await this.scanBitable(file, fields, used)
-      : (() => { throw new Error(`不支持的模板类型：${file.name} (${file.type})`); })();
+  async scanFile(file: DriveFile, fields: Record<string, string>, used = new Set<string>(), sheetScopes: SheetScope[] = []): Promise<ScannedFile> {
+    let scan: ScanResult;
+    try {
+      scan = file.type === 'docx' ? await this.scanDocx(file, fields, used)
+        : file.type === 'sheet' ? await this.scanSheet(file, fields, used, sheetScopes)
+        : file.type === 'bitable' ? await this.scanBitable(file, fields, used)
+        : (() => { throw new Error(`不支持的模板类型：${file.name} (${file.type})`); })();
+    } catch (error) {
+      throw new Error(`扫描模板“${file.name}”（${file.type}）失败：${String(error)}`, { cause: error });
+    }
     if ((file.type === 'sheet' || file.type === 'bitable') && file.name.includes('{{')) {
       const after = replacement(file.name, fields, used);
       if (after === file.name || after.includes('{{') || after.length > 255) throw new Error(`${file.name} 的文件标题占位符无法安全替换`);
@@ -256,18 +319,26 @@ export class ReleaseMaterialsService {
     if (!files.length) throw new Error('模板文件夹当前层没有可复制的文档');
     const unsupported = files.filter(f => !['docx', 'sheet', 'bitable'].includes(f.type));
     if (unsupported.length) throw new Error(`模板文件夹含不支持的类型：${unsupported.map(f => `${f.name} (${f.type})`).join('、')}`);
+    for (const scope of parsed.sheetScopes ?? []) if (!files.some(file => file.type === 'sheet' && file.name === scope.fileName)) throw new Error(`sheetScopes 指定的表格文件不存在：${scope.fileName}`);
     const used = new Set<string>();
     const scanned: ScannedFile[] = [];
-    for (const file of files) scanned.push(await this.scanFile(file, parsed.fields, used));
-    if (!used.size) throw new Error('模板中未找到任何 {{字段名}} 占位符，请检查模板');
-    return { input: parsed, templateFolderToken, materialsParentToken, files: scanned, ignoredFolders };
+    for (const file of files) scanned.push(await this.scanFile(file, parsed.fields, used, parsed.sheetScopes));
+    const unusedFields = Object.keys(parsed.fields).filter(name => name !== '下发编号' && !used.has(name)
+      && !(name === '版本负责人' && used.has('版本负责任'))
+      && !(name === '版本负责任' && used.has('版本负责人')));
+    return { input: parsed, templateFolderToken, materialsParentToken, files: scanned, ignoredFolders, unusedFields };
   }
 
   async createJob(caller: Caller, manifest: ReleaseManifest, messageCreatedAt = Date.now()): Promise<{ jobId: string; reused: boolean; status: string; approvalId?: string }> {
+    if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮下发已取消');
     const db = await stateDb();
     const jobId = randomUUID();
     const requestKey = createHash('sha256').update(JSON.stringify([caller.userId, caller.chatId, messageCreatedAt, manifest.input])).digest('hex');
-    const inserted = await db.execute({ sql: `INSERT OR IGNORE INTO release_jobs(id, requester_id, chat_id, status, manifest_json, request_key, created_at, updated_at) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)`, args: [jobId, caller.userId, caller.chatId, JSON.stringify(manifest), requestKey, Date.now(), Date.now()] });
+    const inserted = await db.execute({ sql: `INSERT OR IGNORE INTO release_jobs(id, requester_id, chat_id, status, manifest_json, request_key, created_at, updated_at, origin_message_id) VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)`, args: [jobId, caller.userId, caller.chatId, JSON.stringify(manifest), requestKey, Date.now(), Date.now(), caller.messageId ?? null] });
+    if (await isMessageRecalled(caller.messageId)) {
+      await db.execute({ sql: "UPDATE release_jobs SET status = 'denied', error = '原始消息已撤回' WHERE id = ? AND status = 'pending'", args: [jobId] });
+      throw new Error('原始消息已撤回，本轮下发已取消');
+    }
     if (!inserted.rowsAffected) {
       const existing = (await db.execute({ sql: 'SELECT id, status, approval_id FROM release_jobs WHERE request_key = ?', args: [requestKey] })).rows[0];
       return { jobId: String(existing.id), reused: true, status: String(existing.status), approvalId: typeof existing.approval_id === 'string' ? existing.approval_id : undefined };
@@ -296,9 +367,25 @@ export class ReleaseMaterialsService {
         await db.execute({ sql: "UPDATE release_files SET status = 'copying' WHERE job_id = ? AND source_token = ?", args: [jobId, file.token] });
         const copy = await this.copyFile(file, folder.token);
         await db.execute({ sql: "UPDATE release_files SET status = 'waiting', copy_token = ?, copy_url = ? WHERE job_id = ? AND source_token = ?", args: [copy.token, copy.url ?? null, jobId, file.token] });
+        if (!file.patches.length) {
+          let visible = false;
+          for (let attempt = 0; attempt < 8; attempt++) {
+            const entry = (await this.listFolder(folder.token)).find(item => item.token === copy.token);
+            if (entry) {
+              if (entry.type !== file.type || entry.name !== file.name) throw new Error(`副本 ${file.name} 的类型或文件名与模板不一致，已停止`);
+              visible = true;
+              break;
+            }
+            if (attempt < 7) await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1)));
+          }
+          if (!visible) throw new Error(`副本 ${file.name} 尚未出现在材料目录中，请人工核对`);
+          await db.execute({ sql: "UPDATE release_files SET status = 'completed' WHERE job_id = ? AND source_token = ?", args: [jobId, file.token] });
+          resultFiles.push({ name: file.name, url: copy.url ?? `${new URL(manifest.input.materialsParentUrl).origin}/${file.type === 'sheet' ? 'sheets' : file.type === 'bitable' ? 'base' : 'docx'}/${copy.token}` });
+          continue;
+        }
         let scanned: ScannedFile | undefined;
         for (let attempt = 0; attempt < 8; attempt++) {
-          try { scanned = await this.scanFile({ ...file, token: copy.token }, manifest.input.fields); break; }
+          try { scanned = await this.scanFile({ ...file, token: copy.token }, manifest.input.fields, new Set(), manifest.input.sheetScopes); break; }
           catch (error) { if (attempt === 7) throw new Error(`副本 ${file.name} 尚不可读或扫描失败：${String(error)}`); await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1))); }
         }
         if (!scanned || !same(scanned.patches.map(p => [p.location.replace(/rec[\w]+/, 'record'), p.field, p.before, p.after]), file.patches.map(p => [p.location.replace(/rec[\w]+/, 'record'), p.field, p.before, p.after]))) throw new Error(`副本 ${file.name} 与审批预览不一致，已停止`);
@@ -327,6 +414,7 @@ export class ReleaseMaterialsService {
   }
 
   private async writeCopy(file: ScannedFile, folderToken: string): Promise<void> {
+    if (file.type === 'sheet') await this.assertSheetMerges(file);
     const fileNamePatch = file.patches.find(p => p.fileName);
     if (fileNamePatch) await this.renameFile(file.token, file.type as ReleaseType, folderToken, fileNamePatch.before, fileNamePatch.after);
     if (file.type === 'docx') {
@@ -352,6 +440,7 @@ export class ReleaseMaterialsService {
   }
 
   private async verifyCopy(file: ScannedFile, folderToken: string): Promise<void> {
+    if (file.type === 'sheet') await this.assertSheetMerges(file);
     for (const patch of file.patches) {
       if (patch.fileName) {
         const actual = (await this.listFolder(folderToken)).find(item => item.token === file.token);
@@ -366,7 +455,7 @@ export class ReleaseMaterialsService {
         if (candidates.length !== 1 || !(patch.title ? titleMatches : same(actual, patch.elements))) throw new Error(`${file.name} ${patch.location} 回读内容不符，请人工核对`);
       } else if (file.type === 'sheet') {
         const range = `${patch.sheetId}!${patch.cell}:${patch.cell}`;
-        const data = await this.api.call({ method: 'GET', url: `/open-apis/sheets/v2/spreadsheets/${enc(file.token)}/values/${enc(range)}` });
+        const data = await this.api.call({ method: 'GET', url: `/open-apis/sheets/v2/spreadsheets/${enc(file.token)}/values/${range}` });
         const actual = (data.valueRange as { values?: unknown[][] } | undefined)?.values?.[0]?.[0];
         if (actual !== patch.after) throw new Error(`${file.name} ${patch.location} 回读内容不符，请人工核对`);
       } else {
@@ -375,6 +464,21 @@ export class ReleaseMaterialsService {
         const actual = typeof value === 'string' ? value : Array.isArray(value) ? value.map(v => typeof v?.text === 'string' ? v.text : '').join('') : '';
         if (actual !== patch.after) throw new Error(`${file.name} ${patch.location} 回读内容不符，请人工核对`);
       }
+    }
+  }
+
+  private async assertSheetMerges(file: ScannedFile): Promise<void> {
+    const patches = file.patches.filter(p => p.sheetId && p.cell);
+    if (!patches.length) return;
+    const data = await this.api.call({ method: 'GET', url: `/open-apis/sheets/v3/spreadsheets/${enc(file.token)}/sheets/query` });
+    const sheets = (data.sheets as Sheet[] | undefined) ?? [];
+    for (const patch of patches) {
+      const sheet = sheets.find(item => item.sheet_id === patch.sheetId);
+      if (!sheet) throw new Error(`${file.name} 的工作表已变化，已停止写入`);
+      const cell = /^([A-Z]+)([1-9]\d*)$/.exec(patch.cell!);
+      if (!cell) throw new Error(`${file.name} 的单元格坐标无效，已停止写入`);
+      const merge = mergeAt(sheet, Number(cell[2]) - 1, columnIndex(cell[1]));
+      if (merge?.range !== patch.mergeRange || (merge && merge.anchor !== patch.cell)) throw new Error(`${file.name} ${patch.location} 的合并区域已变化，已停止写入`);
     }
   }
 }

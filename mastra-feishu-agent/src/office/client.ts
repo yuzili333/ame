@@ -4,7 +4,7 @@ import type { OfficeAction } from './actions';
 import { TableService } from './table-service';
 import { ReleaseMaterialsService } from './release-materials';
 
-type ApiResult = { code?: number; msg?: string; data?: Record<string, unknown> };
+type ApiResult = { code?: number; msg?: string; data?: Record<string, unknown>; error?: { log_id?: string; field_violations?: Array<{ field?: string; description?: string }> } };
 export type ApiRequest = { method: 'GET' | 'POST' | 'PATCH' | 'PUT'; url: string; data?: unknown; params?: Record<string, unknown>; userAccessToken?: string };
 export type OfficeTransport = { request(request: ApiRequest): Promise<ApiResult>; send(chatId: string, text: string): Promise<unknown> };
 
@@ -17,6 +17,20 @@ export function createOfficeTransport(channel: LarkChannel): OfficeTransport {
 
 function id(value: string) { return encodeURIComponent(value); }
 
+function safeEndpoint(url: string): string {
+  return url
+    .replace(/(\/spreadsheets\/)[^/]+/g, '$1:spreadsheet_token')
+    .replace(/(\/values\/)[^/]+/g, '$1:range')
+    .replace(/(\/sheets\/)[^/]+(?=\/(?:find|replace|filter|float_images)(?:\/|$))/g, '$1:sheet_id')
+    .replace(/(\/(?:files|folders|permissions|documents|apps|tables|records)\/)[^/]+/g, '$1:id');
+}
+
+function apiError(request: ApiRequest, result: ApiResult): Error {
+  const violations = result.error?.field_violations?.map(v => `${v.field ?? 'field'}: ${v.description ?? 'invalid'}`).join('; ');
+  const details = [`params=${Object.keys(request.params ?? {}).join(',') || 'none'}`, violations, result.error?.log_id && `log_id=${result.error.log_id}`].filter(Boolean).join('; ');
+  return new Error(`Feishu API ${result.code}: ${result.msg || 'request failed'} [${request.method} ${safeEndpoint(request.url)}${details ? `; ${details}` : ''}]`);
+}
+
 export class OfficeApi {
   constructor(private readonly transport: OfficeTransport) {}
 
@@ -25,23 +39,24 @@ export class OfficeApi {
     try {
       response = await this.transport.request(request);
     } catch (error) {
-      const response = (error as { response?: { status?: number; data?: { code?: number; msg?: string } } })?.response;
+      const response = (error as { response?: { status?: number; data?: ApiResult } })?.response;
       const apiCode = response?.data?.code;
       if (typeof apiCode === 'number' && apiCode !== 0) {
-        throw new Error(`Feishu API ${apiCode}: ${response?.data?.msg || 'request failed'}`);
+        throw apiError(request, response!.data!);
       }
       const status = response?.status
         ?? (error as { status?: number })?.status;
       if (status === 404 || status === 405 || status === 501) {
-        throw new Error(`This private Feishu deployment does not provide ${request.method} ${request.url}`);
+        throw new Error(`This private Feishu deployment does not provide ${request.method} ${safeEndpoint(request.url)}`);
       }
-      throw error;
+      const original = error instanceof Error ? error.message : String(error);
+      throw new Error(`${original.replaceAll(request.url, safeEndpoint(request.url))} [${request.method} ${safeEndpoint(request.url)}; params=${Object.keys(request.params ?? {}).join(',') || 'none'}]`, { cause: error });
     }
     if (response.code !== undefined && response.code !== 0) {
       if ([404, 405, 501].includes(response.code)) {
-        throw new Error(`This private Feishu deployment does not provide ${request.method} ${request.url}: ${response.msg || response.code}`);
+        throw new Error(`This private Feishu deployment does not provide ${request.method} ${safeEndpoint(request.url)}: ${response.msg || response.code}`);
       }
-      throw new Error(`Feishu API ${response.code}: ${response.msg || 'request failed'}`);
+      throw apiError(request, response);
     }
     return response.data ?? {};
   }

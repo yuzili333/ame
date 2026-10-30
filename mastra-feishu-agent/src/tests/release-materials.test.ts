@@ -36,17 +36,21 @@ async function approvedJob(service: InstanceType<typeof ReleaseMaterialsService>
   return jobId;
 }
 
-function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; duplicateFolder?: boolean; failCopy?: boolean; failWrite?: boolean; copyReadDelay?: boolean; formulaMarker?: boolean; ownerTypo?: boolean; docTitleMarker?: boolean; sheetTitleMarker?: boolean; parentGroupPerm?: 'view' | 'edit'; failFolderForbidden?: boolean } = {}) {
+function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; duplicateFolder?: boolean; failCopy?: boolean; failWrite?: boolean; copyReadDelay?: boolean; formulaMarker?: boolean; ownerTypo?: boolean; docTitleMarker?: boolean; sheetTitleMarker?: boolean; sheetMixedText?: boolean; mergedSheet?: boolean; copyMergeChangesAfterScan?: boolean; plainTemplates?: boolean; parentGroupPerm?: 'view' | 'edit'; failFolderForbidden?: boolean } = {}) {
   const calls: import('../office/client').ApiRequest[] = [];
   let created = false;
   let sourceReads = 0;
-  const originalDocText = options.ownerTypo ? '{{下发编号}} / {{版本负责任}}' : '{{下发编号}} / {{负责人}}';
+  const originalDocText = options.plainTemplates ? '普通说明' : options.ownerTypo ? '{{下发编号}} / {{版本负责任}}' : '{{下发编号}} / {{负责人}}';
+  const originalSheetText = options.plainTemplates ? '普通表格' : options.sheetMixedText ? 'L_REL_{{下发编号}}' : '{{日期}}';
+  const originalBaseText = options.plainTemplates ? '普通记录' : '{{负责人}}';
   let docText = originalDocText;
-  let copyTitle = '说明{{下发编号}}';
+  let copyTitle = options.docTitleMarker ? '说明{{下发编号}}' : '说明.docx';
   let copySheetName = options.sheetTitleMarker ? '清单{{下发编号}}' : '清单';
-  let sheetText = '{{日期}}';
-  let baseText = '{{负责人}}';
+  let sheetText = originalSheetText;
+  let baseText = originalBaseText;
+  const copied = new Set<string>();
   let copyReadFailed = false;
+  let copySheetQueries = 0;
   const sourceItems = [
     { token: 'doxcnSource', name: '说明.docx', type: 'docx', modified_time: '1' },
     { token: 'shtSource', name: options.sheetTitleMarker ? '清单{{下发编号}}' : '清单', type: 'sheet', modified_time: '1' },
@@ -64,7 +68,11 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
         const folder = request.params?.folder_token;
         if (folder === 'template') data = request.params?.page_token ? { files: [{ token: options.unsupported ? 'pdf1' : 'baseSource', name: '责任表', type: options.unsupported ? 'file' : 'bitable', modified_time: '1' }], has_more: false } : { files: sourceItems, has_more: true, next_page_token: 'next' };
         else if (folder === 'parent') data = { files: options.duplicateFolder ? [{ token: 'existing', name: '20261029', type: 'folder' }] : created ? [{ token: 'newFolder', name: '20261029', type: 'folder' }] : [], has_more: false };
-        else if (folder === 'newFolder') data = { files: [{ token: 'shtCopy', name: copySheetName, type: 'sheet' }], has_more: false };
+        else if (folder === 'newFolder') data = { files: [
+          ...(copied.has('doxcnCopy') ? [{ token: 'doxcnCopy', name: copyTitle, type: 'docx' }] : []),
+          ...(copied.has('shtCopy') ? [{ token: 'shtCopy', name: copySheetName, type: 'sheet' }] : []),
+          ...(copied.has('baseCopy') ? [{ token: 'baseCopy', name: '责任表', type: 'bitable' }] : []),
+        ], has_more: false };
       } else if (url.endsWith('/create_folder')) {
         if (options.failFolderForbidden) return { code: 1061004, msg: 'forbidden' };
         created = true; data = { token: 'newFolder', url: 'https://feishu.cn/drive/folder/newFolder' };
@@ -72,6 +80,7 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
         if (options.failCopy && url.includes('shtSource')) throw new Error('copy timeout');
         const source = url.split('/').at(-2);
         data = { file: { token: source === 'doxcnSource' ? 'doxcnCopy' : source === 'shtSource' ? 'shtCopy' : 'baseCopy' } };
+        copied.add((data.file as { token: string }).token);
       } else if (url === '/open-apis/drive/v1/files/doxcnCopy' && request.method === 'PATCH') {
         copyTitle = (request.data as { new_title: string }).new_title;
       } else if (url === '/open-apis/drive/v1/files/shtCopy' && request.method === 'PATCH') {
@@ -95,10 +104,14 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
       } else if (url.endsWith('/blocks/doxcnCopy')) {
         data = { block: { block_id: 'doxcnCopy', block_type: 1, page: { elements: [{ text_run: { content: copyTitle } }] } } };
       } else if (url.includes('/sheets/query')) {
-        data = { sheets: [{ sheet_id: url.includes('shtCopy') ? 'sheetCopy' : 'sheetSource', title: 'Main', grid_properties: { row_count: 1, column_count: 2 } }] };
+        const isCopy = url.includes('shtCopy');
+        if (isCopy) copySheetQueries++;
+        const merges = options.mergedSheet && !(isCopy && options.copyMergeChangesAfterScan && copySheetQueries > 1)
+          ? [{ start_row_index: 0, end_row_index: 0, start_column_index: 0, end_column_index: 1 }] : [];
+        data = { sheets: [{ sheet_id: isCopy ? 'sheetCopy' : 'sheetSource', title: 'Main', grid_properties: { row_count: 1, column_count: 2 }, merges }] };
       } else if (url.includes('/sheets/v2/') && url.includes('/values/') && request.method === 'GET') {
         const isCopy = url.includes('shtCopy');
-        data = { valueRange: { values: [[options.formulaMarker ? { type: 'formula', text: '={{日期}}' } : isCopy ? sheetText : '{{日期}}', { type: 'formula', text: '=1+1' }]] } };
+        data = { valueRange: { values: [[options.formulaMarker ? { type: 'formula', text: '={{日期}}' } : isCopy ? sheetText : originalSheetText, { type: 'formula', text: '=1+1' }]] } };
       } else if (url.includes('/sheets/v2/') && request.method === 'PUT') {
         sheetText = (request.data as { valueRange: { values: string[][] } }).valueRange.values[0][0];
       } else if (url.endsWith('/tables')) {
@@ -106,7 +119,7 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
       } else if (url.endsWith('/fields')) {
         data = { items: [{ field_name: '负责人', type: 1 }], has_more: false };
       } else if (url.endsWith('/records')) {
-        data = { items: [{ record_id: url.includes('baseCopy') ? 'recCopy' : 'recSource', fields: { 负责人: [{ text: url.includes('baseCopy') ? baseText : '{{负责人}}' }] } }], has_more: false };
+        data = { items: [{ record_id: url.includes('baseCopy') ? 'recCopy' : 'recSource', fields: { 负责人: [{ text: url.includes('baseCopy') ? baseText : originalBaseText }] } }], has_more: false };
       } else if (url.includes('/records/recCopy') && request.method === 'PUT') {
         baseText = (request.data as { fields: { 负责人: string } }).fields.负责人;
       } else if (url.includes('/records/recCopy') && request.method === 'GET') {
@@ -132,7 +145,11 @@ describe('release materials', () => {
   it('accepts folder links copied from the Feishu client on my.feishu.cn', () => {
     expect(parseDriveFolderUrl('https://my.feishu.cn/drive/folder/VOo7fZqi0lNLSvdQw2XcE0AqnUh')).toBe('VOo7fZqi0lNLSvdQw2XcE0AqnUh');
     expect(parseDriveFolderUrl('https://my.feishu.cn/drive/folder/YyGZfIOUjlpVO1dr8EPcorcun3g')).toBe('YyGZfIOUjlpVO1dr8EPcorcun3g');
-    expect(() => parseDriveFolderUrl('https://example.invalid/drive/folder/x')).toThrow();
+    expect(() => parseDriveFolderUrl('https://example.invalid/drive/folder/x')).toThrow('example.invalid');
+  });
+  it('accepts the configured corporate document host for ordinary Drive folders', () => {
+    expect(parseDriveFolderUrl('https://cibt.co.cibfintech.com/drive/folder/CorpFolderToken'))
+      .toBe('CorpFolderToken');
   });
 
   it('maps the supplied version owner to the template spelling 版本负责任', async () => {
@@ -149,6 +166,13 @@ describe('release materials', () => {
     expect(manifest.files[0].patches[0].after).toContain('张三');
     expect(calls.some(c => c.method !== 'GET')).toBe(false);
     expect(calls.filter(c => c.url === '/open-apis/drive/v1/files' && c.params?.folder_token === 'template')).toHaveLength(2);
+  });
+
+  it('accepts supplied fields absent from the template and reports them as unused', async () => {
+    const { service, calls } = fixture();
+    const manifest = await service.prepare({ ...input, fields: { ...input.fields, 下发日期: '20261030' } });
+    expect(manifest.unusedFields).toEqual(['下发日期']);
+    expect(calls.every(call => !JSON.stringify(call).includes('下发日期'))).toBe(true);
   });
 
   it('stops before approval when the request group can only view the destination folder', async () => {
@@ -169,6 +193,16 @@ describe('release materials', () => {
     await expect(service.executeJob(jobId)).rejects.toThrow('已执行或状态不明');
     const row = (await (await stateDb()).execute({ sql: 'SELECT status FROM release_jobs WHERE id = ?', args: [jobId] })).rows[0];
     expect(row.status).toBe('completed');
+  });
+
+  it('copies files without matching placeholders unchanged and skips content writes', async () => {
+    const { service, calls } = fixture({ plainTemplates: true });
+    const manifest = await service.prepare(input);
+    expect(manifest.files.map(file => file.patches.length)).toEqual([0, 0, 0]);
+    const result = await service.executeJob(await approvedJob(service, manifest));
+    expect(result.files.map(file => file.name)).toEqual(['说明.docx', '清单', '责任表']);
+    expect(calls.filter(call => call.url.endsWith('/copy'))).toHaveLength(3);
+    expect(calls.filter(call => ['PATCH', 'PUT'].includes(call.method))).toHaveLength(0);
   });
 
   it('updates a Docx page title through Drive while keeping it out of the Docx body batch', async () => {
@@ -196,6 +230,35 @@ describe('release materials', () => {
     expect(calls.some(c => c.url === '/open-apis/drive/v1/files/shtSource' && c.method === 'PATCH')).toBe(false);
     const writes = calls.filter(c => c.url.includes('/sheets/v2/') && c.method === 'PUT');
     expect(writes).toHaveLength(1);
+  });
+
+  it('does not write a copied merged cell if its merge changes after scanning', async () => {
+    const { service, calls } = fixture({ mergedSheet: true, copyMergeChangesAfterScan: true });
+    const manifest = await service.prepare(input);
+    expect(manifest.files[1].patches[0]).toMatchObject({ mergeRange: 'A1:B1', cell: 'A1' });
+    const jobId = await approvedJob(service, manifest);
+    await expect(service.executeJob(jobId)).rejects.toThrow('合并区域已变化');
+    expect(calls.filter(call => call.url.includes('/sheets/v2/') && call.method === 'PUT')).toHaveLength(0);
+  });
+
+  it('writes and verifies a matched placeholder in the copied merged-cell anchor', async () => {
+    const { service, calls } = fixture({ mergedSheet: true });
+    const manifest = await service.prepare(input);
+    expect(manifest.files[1].patches[0]).toMatchObject({ cell: 'A1', mergeRange: 'A1:B1' });
+    await service.executeJob(await approvedJob(service, manifest));
+    const writes = calls.filter(call => call.url.includes('/sheets/v2/') && call.method === 'PUT');
+    expect(writes).toHaveLength(1);
+    expect(writes[0].data).toMatchObject({ valueRange: { range: 'sheetCopy!A1:A1', values: [['2026-10-29']] } });
+  });
+
+  it('writes a mixed-text spreadsheet placeholder only in the approved copy', async () => {
+    const { service, calls } = fixture({ sheetMixedText: true });
+    const manifest = await service.prepare(input);
+    expect(manifest.files[1].patches[0]).toMatchObject({ before: 'L_REL_{{下发编号}}', after: 'L_REL_20261029' });
+    await service.executeJob(await approvedJob(service, manifest));
+    const writes = calls.filter(call => call.url.includes('/sheets/v2/') && call.method === 'PUT');
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toMatchObject({ url: '/open-apis/sheets/v2/spreadsheets/shtCopy/values', data: { valueRange: { values: [['L_REL_20261029']] } } });
   });
 
   it('refuses to rename when the copied file title has changed since approval', async () => {

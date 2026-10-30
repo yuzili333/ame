@@ -3,11 +3,11 @@ import type { Caller } from '../identity';
 import { type OfficeAction } from './actions';
 import { getOfficeApi } from '../runtime/office-bridge';
 import { requestOfficeApproval } from '../runtime/approval-bridge';
-import { stateDb } from '../state/store';
+import { isMessageRecalled, stateDb } from '../state/store';
 import { authorizationUrl, exchangeCodeForUser, invalidateUserAccessToken, userAccessToken } from './user-auth';
 
 type CalendarAction = Extract<OfficeAction, { kind: 'calendar_create' | 'calendar_update' }>;
-type Pending = { id: string; requester_id: string; chat_id: string; chat_type?: Caller['chatType']; payload: string; status: string; expires_at: number };
+type Pending = { id: string; requester_id: string; chat_id: string; chat_type?: Caller['chatType']; payload: string; status: string; expires_at: number; origin_message_id?: string | null };
 type Notifier = (chatId: string, text: string) => Promise<void>;
 let notifier: Notifier | undefined;
 export function setPermissionNotifier(value: Notifier | undefined) { notifier = value; }
@@ -30,11 +30,12 @@ function isCalendarAuthorizationError(error: unknown): boolean {
 }
 
 async function createPending(caller: Caller, action: CalendarAction, reauthorize = false) {
+  if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮日程请求已取消');
   const db = await stateDb();
   await db.execute({ sql: `UPDATE permission_requests SET status = 'superseded' WHERE requester_id = ? AND chat_id = ? AND status IN ('choice','choice_reauth','calendar_id','calendar_id_reauth','auth','failed','table_choice','table_auth','table_failed')`, args: [caller.userId, caller.chatId] });
   const id = randomUUID();
-  await db.execute({ sql: `INSERT INTO permission_requests(id, requester_id, chat_id, chat_type, payload, status, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, args: [id, caller.userId, caller.chatId, caller.chatType, JSON.stringify(action), reauthorize ? 'choice_reauth' : 'choice', Date.now(), Date.now() + 30 * 60_000] });
+  await db.execute({ sql: `INSERT INTO permission_requests(id, requester_id, chat_id, chat_type, payload, status, created_at, expires_at, origin_message_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, args: [id, caller.userId, caller.chatId, caller.chatType, JSON.stringify(action), reauthorize ? 'choice_reauth' : 'choice', Date.now(), Date.now() + 30 * 60_000, caller.messageId ?? null] });
   return id;
 }
 
@@ -105,6 +106,11 @@ export async function resolvePermissionReply(caller: Caller, content: string): P
     await sendAuthorizationLink(caller, requestId, action);
     return true;
   }
+  if (await isMessageRecalled(pending.origin_message_id ?? undefined)) {
+    await db.execute({ sql: "UPDATE permission_requests SET status = 'cancelled' WHERE id = ?", args: [pending.id] });
+    return true;
+  }
+  const originCaller = { ...caller, messageId: pending.origin_message_id ?? caller.messageId };
   if (/^(取消|算了|cancel)$/i.test(answer)) {
     await db.execute({ sql: "UPDATE permission_requests SET status = 'cancelled' WHERE id = ?", args: [pending.id] });
     await tell(caller.chatId, '已取消这次日程请求。');
@@ -114,7 +120,7 @@ export async function resolvePermissionReply(caller: Caller, content: string): P
   if (pending.status.startsWith('calendar_id') && !/^(用户权限|用户身份|个人日历|user|应用权限|应用身份|app)$/i.test(answer)) {
     const calendarId = answer.match(/^[\w@.-]{1,256}$/)?.[0];
     if (!calendarId || action.kind !== 'calendar_create') return false;
-    await approveResolved(caller, { ...action, calendarId, permissionMode: 'app' });
+    await approveResolved(originCaller, { ...action, calendarId, permissionMode: 'app' });
     await db.execute({ sql: "UPDATE permission_requests SET status = 'completed' WHERE id = ?", args: [pending.id] });
     return true;
   }
@@ -123,7 +129,7 @@ export async function resolvePermissionReply(caller: Caller, content: string): P
       await db.execute({ sql: 'UPDATE permission_requests SET status = ? WHERE id = ?', args: [pending.status.endsWith('_reauth') ? 'calendar_id_reauth' : 'calendar_id', pending.id] });
       await tell(caller.chatId, '请发送要写入的共享日历 ID。机器人必须对该日历有写入权限；收到 ID 后才会发审批卡片。');
     } else {
-      await approveResolved(caller, { ...action, permissionMode: 'app' });
+      await approveResolved(originCaller, { ...action, permissionMode: 'app' });
       await db.execute({ sql: "UPDATE permission_requests SET status = 'completed' WHERE id = ?", args: [pending.id] });
     }
     return true;
@@ -134,7 +140,7 @@ export async function resolvePermissionReply(caller: Caller, content: string): P
       const token = await userAccessToken(caller.userId);
       if (token) {
         try {
-          await approveResolved(caller, selected);
+          await approveResolved(originCaller, selected);
           await db.execute({ sql: "UPDATE permission_requests SET status = 'completed' WHERE id = ?", args: [pending.id] });
           return true;
         } catch (error) {
@@ -155,8 +161,12 @@ export async function completeCalendarAuthorization(state: string, code: string)
     WHERE id = ? AND status = 'auth' AND expires_at > ? RETURNING *`, args: [state, Date.now()] });
   const pending = claimed.rows[0] as unknown as Pending | undefined;
   if (!pending) throw new Error('授权请求已失效或已处理');
+  if (await isMessageRecalled(pending.origin_message_id ?? undefined)) {
+    await db.execute({ sql: "UPDATE permission_requests SET status = 'cancelled' WHERE id = ?", args: [state] });
+    throw new Error('原始消息已撤回，授权请求已取消');
+  }
   const action = JSON.parse(pending.payload) as CalendarAction;
-  const caller: Caller = { userId: pending.requester_id, chatId: pending.chat_id, chatType: pending.chat_type ?? 'p2p' };
+  const caller: Caller = { userId: pending.requester_id, chatId: pending.chat_id, chatType: pending.chat_type ?? 'p2p', messageId: pending.origin_message_id ?? undefined };
   let exchangedToken: string | undefined;
   try {
     exchangedToken = await exchangeCodeForUser(code, caller.userId);

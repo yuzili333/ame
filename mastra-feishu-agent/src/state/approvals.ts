@@ -2,21 +2,26 @@ import { randomUUID } from 'node:crypto';
 import type { Client } from '@libsql/client';
 import { officeAction, type OfficeAction } from '../office/actions';
 import type { Caller } from '../identity';
-import { getAction, stateDb, type StoredAction } from './store';
+import { getAction, isMessageRecalled, stateDb, type StoredAction } from './store';
 
 export const APPROVAL_TTL_MS = 30 * 60 * 1000;
 
 export type ProposedAction = OfficeAction | { kind: 'mastra_tool'; toolName: string; arguments: unknown };
 
 export async function proposeAction(caller: Caller, action: ProposedAction, options?: { toolCallId?: string; sessionId?: string }): Promise<StoredAction> {
+  if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮操作已取消');
   const db = await stateDb();
   const now = Date.now();
   const id = randomUUID();
   await db.execute({
-    sql: `INSERT INTO actions(id, kind, payload, requester_id, chat_id, chat_type, status, created_at, expires_at, tool_call_id, session_id)
-          VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
-    args: [id, action.kind, JSON.stringify(action), caller.userId, caller.chatId, caller.chatType, now, now + APPROVAL_TTL_MS, options?.toolCallId ?? null, options?.sessionId ?? null],
+    sql: `INSERT INTO actions(id, kind, payload, requester_id, chat_id, chat_type, status, created_at, expires_at, tool_call_id, session_id, origin_message_id)
+          VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)`,
+    args: [id, action.kind, JSON.stringify(action), caller.userId, caller.chatId, caller.chatType, now, now + APPROVAL_TTL_MS, options?.toolCallId ?? null, options?.sessionId ?? null, caller.messageId ?? null],
   });
+  if (await isMessageRecalled(caller.messageId)) {
+    await db.execute({ sql: "UPDATE actions SET status = 'denied', result = '原始消息已撤回' WHERE id = ? AND status = 'pending'", args: [id] });
+    throw new Error('原始消息已撤回，本轮操作已取消');
+  }
   return (await getAction(id))!;
 }
 
@@ -45,6 +50,10 @@ export async function decideAction(
   const db = await stateDb();
   const action = await getAction(id);
   if (!action || action.requester_id !== caller.userId || action.chat_id !== caller.chatId) return { status: 'denied' };
+  if (await isMessageRecalled(action.origin_message_id ?? undefined)) {
+    await db.execute({ sql: "UPDATE actions SET status = 'denied', result = '原始消息已撤回' WHERE id = ? AND status = 'pending'", args: [id] });
+    return { status: 'denied', action };
+  }
   if (action.status !== 'pending') return { status: action.status, action };
   if (action.expires_at < Date.now()) {
     await db.execute({ sql: "UPDATE actions SET status = 'expired' WHERE id = ? AND status = 'pending'", args: [id] });

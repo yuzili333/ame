@@ -1,7 +1,7 @@
 import type { NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { config } from './config';
 
-export type Caller = { userId: string; chatId: string; chatType: 'p2p' | 'group' };
+export type Caller = { userId: string; chatId: string; chatType: 'p2p' | 'group'; messageId?: string };
 
 export function isAuthorizedCaller(caller: Caller): boolean {
   if (!caller.userId || !caller.chatId) return false;

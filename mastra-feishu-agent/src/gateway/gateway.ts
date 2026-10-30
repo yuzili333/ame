@@ -1,4 +1,4 @@
-import { createLarkChannel, type CardActionEvent, type LarkChannel, type NormalizedMessage } from '@larksuiteoapi/node-sdk';
+import { createLarkChannel, type CardActionEvent, type EventDispatcher, type LarkChannel, type NormalizedMessage } from '@larksuiteoapi/node-sdk';
 import { RequestContext } from '@mastra/core/request-context';
 import type { Server } from 'node:http';
 import { z } from 'zod';
@@ -18,7 +18,7 @@ import { parseFirstEmptySheetCellRequest } from '../office/table-request';
 import { setApprovalNotifier } from '../runtime/approval-bridge';
 import { setOfficeApi, setOfficeTextSender } from '../runtime/office-bridge';
 import { APPROVAL_TTL_MS, decideAction, expireAction, proposeAction } from '../state/approvals';
-import { getAction, markMessageSeen, recoverInterruptedApprovals, recoverInterruptedWorkflows, stateDb } from '../state/store';
+import { getAction, isMessageRecalled, markMessageSeen, recoverInterruptedApprovals, recoverInterruptedWorkflows, stateDb } from '../state/store';
 import { approvalCard, cardDecision, resolvedCard } from './cards';
 import { safeSdkLogger } from './safe-sdk-logger';
 
@@ -34,7 +34,8 @@ export class FeishuGateway {
   readonly office: OfficeApi;
   private readonly sessions = new Map<string, Session>();
   private readonly queues = new Map<string, Promise<void>>();
-  private readonly activeRuns = new Map<string, { unsubscribe: () => void }>();
+  private readonly activeRuns = new Map<string, { messageId: string; chatId: string; cancel: () => void; unsubscribe: () => void }>();
+  private readonly drainingChats = new Set<string>();
   private oauthServer: Server | undefined;
 
   constructor(channel?: LarkChannel) {
@@ -58,7 +59,9 @@ export class FeishuGateway {
     setOfficeApi(this.office);
     setOfficeTextSender(async (chatId, content) => { await this.channel.send(chatId, { markdown: content }); });
     setApprovalNotifier(async (chatId, actionId, summary) => {
-      await this.channel.send(chatId, { card: approvalCard(actionId, summary) });
+      const sent = await this.channel.send(chatId, { card: approvalCard(actionId, summary) });
+      await (await stateDb()).execute({ sql: 'UPDATE actions SET card_message_id = ? WHERE id = ?', args: [sent.messageId, actionId] });
+      if ((await getAction(actionId))?.status === 'denied') await this.channel.updateCard(sent.messageId, resolvedCard('denied', '原始消息已撤回，本轮操作已取消'));
     });
     setPermissionNotifier(async (chatId, text) => { await this.channel.send(chatId, { text }); });
     setTablePermissionNotifier(async (chatId, text) => { await this.channel.send(chatId, { text }); });
@@ -68,9 +71,19 @@ export class FeishuGateway {
       else await completeCalendarAuthorization(state, code);
     });
     this.channel.on('message', message => { void this.enqueue(message).catch(error => this.report(error)); });
+    // LarkChannel does not expose recalled messages in EventMap, but its SDK
+    // EventDispatcher accepts the same event on the existing WebSocket.
+    const dispatcher = (this.channel as unknown as { dispatcher?: EventDispatcher }).dispatcher;
+    if (!dispatcher?.register) throw new Error('当前飞书 SDK 不支持注册消息撤回事件');
+    dispatcher.register({ 'im.message.recalled_v1': event => {
+      if (event.message_id && event.chat_id) void this.onMessageRecalled({ messageId: event.message_id, chatId: event.chat_id }).catch(error => this.report(error));
+    } });
     this.channel.on('cardAction', event => { void this.onCardAction(event).catch(error => this.report(error)); });
     this.channel.on('error', error => this.report(error));
     await this.channel.connect();
+    await (await stateDb()).execute({ sql: "UPDATE queued_messages SET status = 'interrupted' WHERE status = 'running'" });
+    const pendingChats = (await (await stateDb()).execute({ sql: "SELECT DISTINCT chat_id FROM queued_messages WHERE status = 'pending'" })).rows;
+    for (const row of pendingChats) void this.drainQueue(String(row.chat_id)).catch(error => this.report(error));
   }
 
   async stop() {
@@ -89,22 +102,90 @@ export class FeishuGateway {
     console.error(error instanceof Error ? error.message : String(error));
   }
 
-  private enqueue(message: NormalizedMessage): Promise<void> {
-    const before = this.queues.get(message.chatId) ?? Promise.resolve();
-    const after = before.catch(() => {}).then(() => this.onMessage(message));
-    this.queues.set(message.chatId, after);
-    void after.finally(() => { if (this.queues.get(message.chatId) === after) this.queues.delete(message.chatId); }).catch(() => {});
+  private serialize(chatId: string, job: () => Promise<void>): Promise<void> {
+    const before = this.queues.get(chatId) ?? Promise.resolve();
+    const after = before.catch(() => {}).then(job);
+    this.queues.set(chatId, after);
+    void after.finally(() => { if (this.queues.get(chatId) === after) this.queues.delete(chatId); }).catch(() => {});
     return after;
   }
+  private enqueue(message: NormalizedMessage): Promise<void> {
+    // Admit later messages to the durable queue while the current message is
+    // still waiting on the model or a workflow. The serialized job can be long.
+    if (this.queues.has(message.chatId)) return this.onMessage(message, false, true);
+    return this.serialize(message.chatId, () => this.onMessage(message));
+  }
 
-  async onMessage(message: NormalizedMessage) {
+  async onMessageRecalled(event: { messageId: string; chatId: string }): Promise<void> {
+    const db = await stateDb();
+    await db.execute({ sql: 'INSERT OR IGNORE INTO recalled_messages(message_id, chat_id, recalled_at) VALUES (?, ?, ?)', args: [event.messageId, event.chatId, Date.now()] });
+    await db.execute({ sql: "UPDATE queued_messages SET status = 'cancelled' WHERE message_id = ? AND chat_id = ? AND status IN ('pending','running')", args: [event.messageId, event.chatId] });
+    await db.execute({ sql: "UPDATE actions SET status = 'denied', result = '原始消息已撤回' WHERE origin_message_id = ? AND chat_id = ? AND status = 'pending'", args: [event.messageId, event.chatId] });
+    await db.execute({ sql: "UPDATE release_jobs SET status = 'denied', error = '原始消息已撤回', updated_at = ? WHERE origin_message_id = ? AND chat_id = ? AND status = 'pending'", args: [Date.now(), event.messageId, event.chatId] });
+    await db.execute({ sql: "UPDATE permission_requests SET status = 'cancelled' WHERE origin_message_id = ? AND chat_id = ? AND status IN ('choice','choice_reauth','calendar_id','calendar_id_reauth','auth','table_choice','table_auth')", args: [event.messageId, event.chatId] });
+    const cards = (await db.execute({ sql: "SELECT card_message_id FROM actions WHERE origin_message_id = ? AND chat_id = ? AND status = 'denied' AND card_message_id IS NOT NULL", args: [event.messageId, event.chatId] })).rows;
+    for (const card of cards) try { await this.channel.updateCard(String(card.card_message_id), resolvedCard('denied', '原始消息已撤回，本轮操作已取消')); }
+    catch (error) { this.report(error); }
+    for (const run of this.activeRuns.values()) if (run.messageId === event.messageId && run.chatId === event.chatId) run.cancel();
+    await this.drainQueue(event.chatId);
+  }
+
+  private async queueMessage(message: NormalizedMessage): Promise<void> {
+    const db = await stateDb();
+    const count = (await db.execute({ sql: "SELECT count(*) AS n FROM queued_messages WHERE chat_id = ? AND status = 'pending'", args: [message.chatId] })).rows[0];
+    if (Number(count.n) >= 20) {
+      await this.channel.send(message.chatId, { text: '当前会话已有 20 条待处理指令，请稍后再发送。' }, { replyTo: message.messageId });
+      return;
+    }
+    await db.execute({ sql: "INSERT OR IGNORE INTO queued_messages(message_id, chat_id, message_json, status, created_at) VALUES (?, ?, ?, 'pending', ?)", args: [message.messageId, message.chatId, JSON.stringify({ ...message, raw: undefined }), Date.now()] });
+    if (await isMessageRecalled(message.messageId)) {
+      await db.execute({ sql: "UPDATE queued_messages SET status = 'cancelled' WHERE message_id = ? AND status = 'pending'", args: [message.messageId] });
+      return;
+    }
+    await this.channel.send(message.chatId, { text: '已加入待处理队列；前一轮结束后按发送顺序处理。撤回本消息可取消排队。' }, { replyTo: message.messageId });
+    if (![...this.activeRuns.values()].some(run => run.chatId === message.chatId)) void this.drainQueue(message.chatId).catch(error => this.report(error));
+  }
+
+  private async drainQueue(chatId: string): Promise<void> {
+    if (this.drainingChats.has(chatId)) return;
+    this.drainingChats.add(chatId);
+    try {
+      const db = await stateDb();
+      while (![...this.activeRuns.values()].some(run => run.chatId === chatId)) {
+        const row = (await db.execute({ sql: "SELECT message_id, message_json, created_at FROM queued_messages WHERE chat_id = ? AND status = 'pending' ORDER BY created_at, rowid LIMIT 1", args: [chatId] })).rows[0];
+        if (!row) break;
+        const messageId = String(row.message_id);
+        if (Date.now() - Number(row.created_at) > APPROVAL_TTL_MS) { await db.execute({ sql: "UPDATE queued_messages SET status = 'expired' WHERE message_id = ? AND status = 'pending'", args: [messageId] }); continue; }
+        if (await isMessageRecalled(messageId)) { await db.execute({ sql: "UPDATE queued_messages SET status = 'cancelled' WHERE message_id = ?", args: [messageId] }); continue; }
+        let started = false;
+        await this.serialize(chatId, async () => {
+          if ([...this.activeRuns.values()].some(run => run.chatId === chatId)) return;
+          const claimed = await db.execute({ sql: "UPDATE queued_messages SET status = 'running' WHERE message_id = ? AND status = 'pending' RETURNING message_id", args: [messageId] });
+          if (!claimed.rows.length) return;
+          started = true;
+          try { await this.onMessage(JSON.parse(String(row.message_json)) as NormalizedMessage, true); }
+          finally { await db.execute({ sql: "UPDATE queued_messages SET status = 'done' WHERE message_id = ? AND status = 'running'", args: [messageId] }); }
+        });
+        if (!started) break;
+        if ([...this.activeRuns.values()].some(run => run.messageId === messageId)) break;
+      }
+    } finally { this.drainingChats.delete(chatId); }
+  }
+
+  async onMessage(message: NormalizedMessage, fromQueue = false, busyChat = false) {
     const content = message.content.trim();
     if (!content) return;
-    const caller: Caller = { userId: message.senderId, chatId: message.chatId, chatType: message.chatType };
+    if (await isMessageRecalled(message.messageId)) return;
+    const caller: Caller = { userId: message.senderId, chatId: message.chatId, chatType: message.chatType, messageId: message.messageId };
     const lookupId = idCommand.test(content) && (message.chatType === 'p2p' || message.mentionedBot);
     if (!lookupId && !isAuthorizedMessage(message)) return;
     const releaseRetry = releaseRetryCommand.test(content) ? await this.latestReleaseJob(caller) : null;
-    if (!(await markMessageSeen(message.messageId))) return;
+    if (!fromQueue && !(await markMessageSeen(message.messageId))) return;
+    const pendingQueue = !fromQueue && (await (await stateDb()).execute({ sql: "SELECT 1 FROM queued_messages WHERE chat_id = ? AND status = 'pending' LIMIT 1", args: [message.chatId] })).rows.length > 0;
+    if ((busyChat || this.activeRuns.has(memoryKeys(caller).sessionId) || pendingQueue) && !lookupId) {
+      if (!fromQueue) await this.queueMessage(message);
+      return;
+    }
     try {
       if (lookupId) {
         const text = message.chatType === 'p2p'
@@ -147,7 +228,7 @@ export class FeishuGateway {
       }
     } catch (error) {
       this.report(error);
-      await this.channel.send(message.chatId, { text: '处理失败。请检查模型代理、飞书权限和服务日志。' }, { replyTo: message.messageId });
+      if (!(await isMessageRecalled(message.messageId))) await this.channel.send(message.chatId, { text: '处理失败。请检查模型代理、飞书权限和服务日志。' }, { replyTo: message.messageId });
     }
   }
 
@@ -265,18 +346,16 @@ export class FeishuGateway {
     const session = await this.sessionFor(caller);
     const permissionRequestBefore = await latestPermissionRequestId(caller);
     const sessionId = memoryKeys(caller).sessionId;
-    if (this.activeRuns.has(sessionId)) {
-      await this.channel.send(caller.chatId, { text: '上一轮操作仍在处理或等待确认，请先处理审批卡片。' }, { replyTo });
-      return;
-    }
+    if (this.activeRuns.has(sessionId)) return;
     let reply = '';
     let finished = false;
+    let cancelled = false;
     const finish = async (sendReply: boolean) => {
       if (finished) return;
       finished = true;
       unsubscribe();
       try {
-        if (sendReply && reply.trim() && await latestPermissionRequestId(caller) === permissionRequestBefore) {
+        if (sendReply && !cancelled && !(await isMessageRecalled(replyTo)) && reply.trim() && await latestPermissionRequestId(caller) === permissionRequestBefore) {
           let outgoing = reply;
           const latestRelease = await this.latestReleaseJob(caller);
           if (latestRelease && content.includes(latestRelease.manifest.input.releaseId) && /下发/.test(content)) {
@@ -288,10 +367,11 @@ export class FeishuGateway {
             const state = latestRelease.status === 'failed' ? '失败' : latestRelease.status === 'denied' ? '被拒绝' : '已过期';
             outgoing = `此前批次已${state}，旧审批卡片不再有效，也没有新的待审批批次。${caller.chatType === 'group' ? '请在群里发送“@机器人 重新发起”' : '请回复“重新发起”'}，我会重新预检并在有权限时发送新卡片。`;
           }
-          await this.channel.send(caller.chatId, { markdown: outgoing }, { replyTo });
+          if (!cancelled && !(await isMessageRecalled(replyTo))) await this.channel.send(caller.chatId, { markdown: outgoing }, { replyTo });
         }
       } finally {
         this.activeRuns.delete(sessionId);
+        void this.drainQueue(caller.chatId).catch(error => this.report(error));
       }
     };
     const unsubscribe = session.subscribe(event => {
@@ -303,7 +383,12 @@ export class FeishuGateway {
         void finish(event.reason !== 'error').catch(error => this.report(error));
       }
     });
-    this.activeRuns.set(sessionId, { unsubscribe });
+    this.activeRuns.set(sessionId, { messageId: replyTo, chatId: caller.chatId, unsubscribe, cancel: () => {
+      cancelled = true;
+      session.abort();
+      const fallback = setTimeout(() => { void finish(false).catch(error => this.report(error)); }, 5_000);
+      fallback.unref();
+    } });
     try {
       const requestContext = new RequestContext();
       requestContext.set('caller', caller);
@@ -323,6 +408,10 @@ export class FeishuGateway {
   }
 
   private async onToolApproval(event: { toolCallId: string; toolName: string; args: unknown }, caller: Caller, session: Session) {
+    if (await isMessageRecalled(caller.messageId)) {
+      await session.respondToToolApproval({ toolCallId: event.toolCallId, decision: 'decline' });
+      return;
+    }
     if (event.toolName === 'ask_user') {
       const args = event.args as { question?: unknown; options?: Array<{ label?: unknown }> } | null;
       const question = typeof args?.question === 'string' ? args.question.trim() : '';
@@ -348,7 +437,9 @@ export class FeishuGateway {
       toolCallId: event.toolCallId, sessionId: keys.sessionId,
     });
     try {
-      await this.channel.send(caller.chatId, { card: approvalCard(proposal.id, `${event.toolName}\n${argumentText}`) });
+      const sent = await this.channel.send(caller.chatId, { card: approvalCard(proposal.id, `${event.toolName}\n${argumentText}`) });
+      await (await stateDb()).execute({ sql: 'UPDATE actions SET card_message_id = ? WHERE id = ?', args: [sent.messageId, proposal.id] });
+      if ((await getAction(proposal.id))?.status === 'denied') await this.channel.updateCard(sent.messageId, resolvedCard('denied', '原始消息已撤回，本轮操作已取消'));
       const timer = setTimeout(() => {
         void expireAction(proposal.id).then(expired => {
           if (expired) return session.respondToToolApproval({ toolCallId: event.toolCallId, decision: 'decline' });

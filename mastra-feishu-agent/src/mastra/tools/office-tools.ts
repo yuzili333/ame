@@ -11,7 +11,7 @@ import { TableService } from '../../office/table-service';
 import { requestTableOperation } from '../../office/table-permission';
 import { ReleaseMaterialsService, parseDriveFolderUrl, releaseInput } from '../../office/release-materials';
 import { sendOfficeText } from '../../runtime/office-bridge';
-import { stateDb } from '../../state/store';
+import { isMessageRecalled, stateDb } from '../../state/store';
 
 const token = z.string().min(1).max(256).regex(/^[\w@.-]+$/);
 const time = z.string().regex(/^\d{10}$/);
@@ -117,7 +117,7 @@ export const copyDriveFileTool = createTool({
 export const renameDriveFileTool = actionTool('drive_file_rename', 'Propose renaming a Docx, Sheets, or Base file in an ordinary Drive folder. Requires requester approval and checks the current title again before writing.');
 export const prepareReleaseMaterialsTool = createTool({
   id: 'office_release_materials',
-  description: 'Preflight a whole release: scan current-level Docx, Sheets and Base templates, list every placeholder, then send one batch approval card. Require both ordinary Drive folder links, release ID and explicit field values. This tool does not write before approval.',
+  description: 'Preflight a whole release: scan current-level Docx, Sheets and Base templates, list every placeholder, then send one batch approval card. Require both ordinary Drive folder links, release ID and explicit field values. Sheets may have different field subsets. For a large Sheets grid, ask for optional sheetScopes entries with exact fileName, sheetName and A1:B20 range; only those worksheets and ranges will be scanned. This tool does not write before approval.',
   inputSchema: releaseInput,
   execute: async (input, context) => requestReleaseMaterials(input, callerFrom(context), context.requestContext.get('messageCreatedAt'), context.requestContext.get('originalMessage')),
 });
@@ -128,21 +128,26 @@ export async function requestReleaseMaterials(input: z.infer<typeof releaseInput
     }
     const service = new ReleaseMaterialsService(getOfficeApi());
     const manifest = await service.prepare(input, caller);
+    if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮下发已取消');
     const job = await service.createJob(caller, manifest, typeof createdAt === 'number' ? createdAt : Date.now());
     if (job.reused) return { status: job.status, approvalId: job.approvalId, jobId: job.jobId };
     const jobId = job.jobId;
     const previews = [
-      `下发材料预览：${input.releaseId}\n模板文件夹：${input.templateFolderUrl}\n材料父目录：${input.materialsParentUrl}\n将创建 ${manifest.files.length} 个副本；原模板不会修改。`,
+      `下发材料预览：${input.releaseId}\n模板文件夹：${input.templateFolderUrl}\n材料父目录：${input.materialsParentUrl}\n将创建 ${manifest.files.length} 个副本；原模板不会修改。${manifest.input.sheetScopes?.length ? `\n限定扫描范围（其他工作表不扫描）：${manifest.input.sheetScopes.map(scope => `${scope.fileName} / ${scope.sheetName}!${scope.range}`).join('；')}` : ''}`,
       ...manifest.files.map((file, index) => `${index + 1}. ${file.name}（${file.type}）\n${file.patches.map(p => `- ${p.location}: ${p.before} → ${p.after}`).join('\n') || '- 无占位符，原样复制'}`),
+      ...(manifest.unusedFields?.length ? [`已提供但模板未使用的字段：${manifest.unusedFields.join('、')}。这些字段不会传给飞书 API，也不会写入副本。`] : []),
       ...(manifest.ignoredFolders.length ? [`忽略当前层子文件夹：${manifest.ignoredFolders.join('、')}`] : []),
     ];
     try {
-      for (const preview of previews) for (let offset = 0; offset < preview.length; offset += 3000) await sendOfficeText(caller.chatId, preview.slice(offset, offset + 3000));
+      for (const preview of previews) for (let offset = 0; offset < preview.length; offset += 3000) {
+        if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮下发已取消');
+        await sendOfficeText(caller.chatId, preview.slice(offset, offset + 3000));
+      }
       const proposal = await requestOfficeApproval(caller, { kind: 'release_materials', jobId, releaseId: input.releaseId, fileCount: manifest.files.length, fieldSummary: Object.entries(input.fields).map(([k, v]) => `${k}=${v}`).join('；').slice(0, 1500) });
       await (await stateDb()).execute({ sql: 'UPDATE release_jobs SET approval_id = ? WHERE id = ?', args: [proposal.approvalId, jobId] });
       return proposal;
     } catch (error) {
-      await (await stateDb()).execute({ sql: "UPDATE release_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ?", args: [String(error), Date.now(), jobId] });
+      await (await stateDb()).execute({ sql: "UPDATE release_jobs SET status = 'failed', error = ?, updated_at = ? WHERE id = ? AND status = 'pending'", args: [String(error), Date.now(), jobId] });
       throw error;
     }
 }

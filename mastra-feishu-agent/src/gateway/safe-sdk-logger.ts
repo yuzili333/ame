@@ -2,11 +2,18 @@ import { config } from '../config';
 
 function safeText(value: unknown): string {
   let text: string;
-  if (typeof value === 'string') text = value;
+  if (Array.isArray(value)) text = value.map(safeText).filter(Boolean).join(' | ');
+  else if (typeof value === 'string') text = value;
   else if (value instanceof Error) text = `${value.name}: ${value.message}`;
   else if (value && typeof value === 'object') {
-    const item = value as { code?: unknown; msg?: unknown; message?: unknown };
-    text = [item.code, item.msg ?? item.message].filter(part => part !== undefined).map(String).join(': ') || '[SDK error object]';
+    const item = value as Record<string, unknown>;
+    const response = item.response && typeof item.response === 'object' ? item.response as Record<string, unknown> : undefined;
+    const data = response?.data && typeof response.data === 'object' ? response.data as Record<string, unknown> : undefined;
+    const parts = [item.message, response?.status !== undefined ? `HTTP ${response.status}` : undefined,
+      item.code !== undefined ? `code ${item.code}` : undefined, item.msg,
+      data?.code !== undefined ? `code ${data.code}` : undefined, data?.msg ?? data?.message];
+    text = parts.filter(part => typeof part === 'string' || typeof part === 'number').map(String).join('; ')
+      || `[SDK error object: ${Object.keys(item).slice(0, 8).join(', ') || 'no fields'}]`;
   } else text = String(value);
   for (const secret of [config.appSecret, config.modelApiKey, config.tokenEncryptionKey]) {
     if (secret) text = text.replaceAll(secret, '[REDACTED]');

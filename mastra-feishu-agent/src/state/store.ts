@@ -17,6 +17,8 @@ export type StoredAction = {
   result: string | null;
   tool_call_id: string | null;
   session_id: string | null;
+  origin_message_id: string | null;
+  card_message_id: string | null;
 };
 
 let clientPromise: Promise<Client> | undefined;
@@ -55,10 +57,20 @@ async function initializeStateDb(): Promise<Client> {
       if (!(error instanceof Error) || !error.message.includes('duplicate column name')) throw error;
     }
   }
+  if (!actionColumns.rows.some(row => row.name === 'origin_message_id')) await db.execute('ALTER TABLE actions ADD COLUMN origin_message_id TEXT');
+  if (!actionColumns.rows.some(row => row.name === 'card_message_id')) await db.execute('ALTER TABLE actions ADD COLUMN card_message_id TEXT');
   await db.execute(`CREATE TABLE IF NOT EXISTS seen_messages (
     message_id TEXT PRIMARY KEY,
     seen_at INTEGER NOT NULL
   )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS recalled_messages (
+    message_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, recalled_at INTEGER NOT NULL
+  )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS queued_messages (
+    message_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, message_json TEXT NOT NULL,
+    status TEXT NOT NULL, created_at INTEGER NOT NULL
+  )`);
+  await db.execute('CREATE INDEX IF NOT EXISTS queued_messages_chat ON queued_messages(chat_id, status, created_at)');
   await db.execute(`CREATE TABLE IF NOT EXISTS workflow_jobs (
     id TEXT PRIMARY KEY,
     run_id TEXT,
@@ -75,6 +87,7 @@ async function initializeStateDb(): Promise<Client> {
     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
   )`);
   const releaseColumns = await db.execute('PRAGMA table_info(release_jobs)');
+  if (!releaseColumns.rows.some(row => row.name === 'origin_message_id')) await db.execute('ALTER TABLE release_jobs ADD COLUMN origin_message_id TEXT');
   if (!releaseColumns.rows.some(row => row.name === 'approval_id')) await db.execute('ALTER TABLE release_jobs ADD COLUMN approval_id TEXT');
   if (!releaseColumns.rows.some(row => row.name === 'request_key')) await db.execute('ALTER TABLE release_jobs ADD COLUMN request_key TEXT');
   await db.execute('CREATE UNIQUE INDEX IF NOT EXISTS release_jobs_request_key ON release_jobs(request_key)');
@@ -95,6 +108,7 @@ async function initializeStateDb(): Promise<Client> {
   )`);
   const permissionColumns = await db.execute('PRAGMA table_info(permission_requests)');
   if (!permissionColumns.rows.some(row => row.name === 'chat_type')) await db.execute('ALTER TABLE permission_requests ADD COLUMN chat_type TEXT');
+  if (!permissionColumns.rows.some(row => row.name === 'origin_message_id')) await db.execute('ALTER TABLE permission_requests ADD COLUMN origin_message_id TEXT');
   await db.execute(`CREATE INDEX IF NOT EXISTS permission_requests_lookup ON permission_requests(requester_id, chat_id, status)`);
   await db.execute(`CREATE TABLE IF NOT EXISTS user_tokens (
     user_id TEXT PRIMARY KEY,
@@ -107,6 +121,12 @@ async function initializeStateDb(): Promise<Client> {
   const tokenColumns = await db.execute('PRAGMA table_info(user_tokens)');
   if (!tokenColumns.rows.some(row => row.name === 'scopes')) await db.execute('ALTER TABLE user_tokens ADD COLUMN scopes TEXT');
   return db;
+}
+
+export async function isMessageRecalled(messageId?: string): Promise<boolean> {
+  if (!messageId) return false;
+  const rows = await (await stateDb()).execute({ sql: 'SELECT 1 FROM recalled_messages WHERE message_id = ?', args: [messageId] });
+  return rows.rows.length > 0;
 }
 
 export async function markMessageSeen(messageId: string): Promise<boolean> {

@@ -3,11 +3,11 @@ import { config } from '../config';
 import type { Caller } from '../identity';
 import { requestOfficeApproval } from '../runtime/approval-bridge';
 import { getOfficeApi } from '../runtime/office-bridge';
-import { stateDb } from '../state/store';
+import { isMessageRecalled, stateDb } from '../state/store';
 import { CALENDAR_SCOPES, authorizationUrl, exchangeCodeForUser, userAccessToken } from './user-auth';
 import { TableService, type TableIntent } from './table-service';
 
-type Pending = { id: string; requester_id: string; chat_id: string; chat_type?: Caller['chatType']; payload: string; status: string; expires_at: number };
+type Pending = { id: string; requester_id: string; chat_id: string; chat_type?: Caller['chatType']; payload: string; status: string; expires_at: number; origin_message_id?: string | null };
 type Notify = (chatId: string, message: string) => Promise<void>;
 let notify: Notify | undefined;
 export function setTablePermissionNotifier(value: Notify | undefined) { notify = value; }
@@ -33,10 +33,11 @@ async function perform(caller: Caller, intent: TableIntent, mode: 'app' | 'user'
 }
 
 async function createPending(caller: Caller, intent: TableIntent, reason: string) {
+  if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮表格请求已取消');
   const db = await stateDb();
   await db.execute({ sql: `UPDATE permission_requests SET status = 'superseded' WHERE requester_id = ? AND chat_id = ? AND status IN ('choice','choice_reauth','calendar_id','calendar_id_reauth','auth','table_choice','table_auth','table_failed','failed')`, args: [caller.userId, caller.chatId] });
   const id = randomUUID();
-  await db.execute({ sql: `INSERT INTO permission_requests(id, requester_id, chat_id, chat_type, payload, status, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 'table_choice', ?, ?)`, args: [id, caller.userId, caller.chatId, caller.chatType, JSON.stringify(intent), Date.now(), Date.now() + 30 * 60_000] });
+  await db.execute({ sql: `INSERT INTO permission_requests(id, requester_id, chat_id, chat_type, payload, status, created_at, expires_at, origin_message_id) VALUES (?, ?, ?, ?, ?, 'table_choice', ?, ?, ?)`, args: [id, caller.userId, caller.chatId, caller.chatType, JSON.stringify(intent), Date.now(), Date.now() + 30 * 60_000, caller.messageId ?? null] });
   const question = `${reason}。是否改用你自己的飞书用户权限访问这份表格？请回复“用户权限”以授权，或回复“应用权限”重试机器人权限；回复“取消”可放弃。此时尚未发起写入审批。`;
   try { await tell(caller.chatId, question); }
   catch (error) { await db.execute({ sql: "UPDATE permission_requests SET status = 'table_failed' WHERE id = ?", args: [id] }); throw error; }
@@ -104,6 +105,11 @@ export async function resolveTablePermissionReply(caller: Caller, content: strin
     }
   }
   if (!pending) return false;
+  if (await isMessageRecalled(pending.origin_message_id ?? undefined)) {
+    await db.execute({ sql: "UPDATE permission_requests SET status = 'cancelled' WHERE id = ?", args: [pending.id] });
+    return true;
+  }
+  const originCaller = { ...caller, messageId: pending.origin_message_id ?? caller.messageId };
   if (/^(取消|算了|cancel)$/i.test(answer)) {
     await db.execute({ sql: "UPDATE permission_requests SET status = 'cancelled' WHERE id = ?", args: [pending.id] });
     await tell(caller.chatId, '已取消这次表格请求。');
@@ -114,7 +120,7 @@ export async function resolveTablePermissionReply(caller: Caller, content: strin
     const token = await userAccessToken(caller.userId, config.tableOAuthScopes);
     if (token) {
       try {
-        const result = await perform(caller, intent, 'user', token);
+        const result = await perform(originCaller, intent, 'user', token);
         await db.execute({ sql: "UPDATE permission_requests SET status = 'completed' WHERE id = ?", args: [pending.id] });
         if ('result' in result) await tell(caller.chatId, JSON.stringify(result.result).slice(0, 3500));
         return true;
@@ -132,7 +138,7 @@ export async function resolveTablePermissionReply(caller: Caller, content: strin
   if (/^(?:B|应用权限|应用身份|app)(?:[\s，,、：:].*)?$/i.test(answer)
     || /^已开通.{0,40}应用.{0,40}权限.{0,30}(?:重试)?$/i.test(answer)) {
     try {
-      const result = await perform(caller, intent, 'app');
+      const result = await perform(originCaller, intent, 'app');
       await db.execute({ sql: "UPDATE permission_requests SET status = 'completed' WHERE id = ?", args: [pending.id] });
       if ('result' in result) await tell(caller.chatId, JSON.stringify(result.result).slice(0, 3500));
     } catch (error) { await tell(caller.chatId, `应用权限仍无法访问：${String(error)}。请回复“用户权限”授权，或“取消”。`); }
@@ -146,7 +152,11 @@ export async function completeTableAuthorization(state: string, code: string) {
   const claimed = await db.execute({ sql: `UPDATE permission_requests SET status = 'table_auth_processing' WHERE id = ? AND status = 'table_auth' AND expires_at > ? RETURNING *`, args: [state, Date.now()] });
   const pending = claimed.rows[0] as unknown as Pending | undefined;
   if (!pending) throw new Error('表格授权请求已失效或已处理');
-  const caller: Caller = { userId: pending.requester_id, chatId: pending.chat_id, chatType: pending.chat_type ?? 'p2p' };
+  if (await isMessageRecalled(pending.origin_message_id ?? undefined)) {
+    await db.execute({ sql: "UPDATE permission_requests SET status = 'cancelled' WHERE id = ?", args: [state] });
+    throw new Error('原始消息已撤回，授权请求已取消');
+  }
+  const caller: Caller = { userId: pending.requester_id, chatId: pending.chat_id, chatType: pending.chat_type ?? 'p2p', messageId: pending.origin_message_id ?? undefined };
   const intent = JSON.parse(pending.payload) as TableIntent;
   try {
     const token = await exchangeCodeForUser(code, caller.userId, [...new Set([...CALENDAR_SCOPES, ...config.tableOAuthScopes])]);
