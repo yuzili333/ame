@@ -99,6 +99,26 @@ describe('persistent admission and approval', () => {
 });
 
 describe('office API transport', () => {
+  it('backs off and retries a rate-limited read without replaying writes', async () => {
+    let reads = 0;
+    let writes = 0;
+    const api = new office.OfficeApi({
+      request: async request => {
+        if (request.method === 'GET') {
+          reads++;
+          return reads === 1 ? { code: 99991400, msg: 'request trigger frequency limit' } : { code: 0, data: { items: [] } };
+        }
+        writes++;
+        return { code: 99991400, msg: 'request trigger frequency limit' };
+      },
+      send: async () => undefined,
+    });
+    expect(await api.call({ method: 'GET', url: '/open-apis/docx/v1/documents/doc1/blocks' })).toEqual({ items: [] });
+    expect(reads).toBe(2);
+    await expect(api.call({ method: 'PATCH', url: '/open-apis/docx/v1/documents/doc1/blocks/batch_update' })).rejects.toThrow('99991400');
+    expect(writes).toBe(1);
+  });
+
   it('uses app-accessible endpoints and surfaces private API failure', async () => {
     const requests: unknown[] = [];
     const api = new office.OfficeApi({
@@ -418,7 +438,6 @@ it('explains a release retry preflight failure instead of silently dropping the 
   const channel = {
     rawClient: { request: async (request: { url: string; params?: Record<string, unknown> }) => {
       if (request.url === '/open-apis/drive/v1/files') return { code: 0, data: { files: request.params?.folder_token === 'template-view' ? [{ token: 'doxcnView', name: '模板', type: 'docx' }] : [], has_more: false } };
-      if (request.url.endsWith('/members')) return { code: 0, data: { items: [{ member_type: 'openchat', member_id: 'g1', perm: 'view' }] } };
       throw new Error(`Unexpected Feishu request ${request.url}`);
     } },
     send: async (_chatId: string, payload: unknown) => { sent.push(payload); return {}; },
@@ -435,7 +454,7 @@ it('explains a release retry preflight failure instead of silently dropping the 
   setApprovalNotifier(async (_chatId, id) => { sent.push({ cardApprovalId: id }); });
   try {
     await gateway.onMessage({ messageId: 'release-retry-view', senderId: 'u1', chatId: 'g1', chatType: 'group', content: '重新发起', mentionedBot: true, rawContentType: 'text', resources: [], mentions: [], mentionAll: false, createTime: 4000 });
-    expect(JSON.stringify(sent)).toContain('仅有查看权限');
+    expect(JSON.stringify(sent)).toContain('扫描模板');
     expect(sent.filter(item => 'cardApprovalId' in (item as object))).toHaveLength(0);
     const jobs = (await db.execute({ sql: "SELECT id FROM release_jobs WHERE requester_id = 'u1' AND chat_id = 'g1' AND manifest_json LIKE '%202610291639%'" })).rows;
     expect(jobs).toHaveLength(1);
@@ -507,6 +526,34 @@ it('grounds a new release reply in its own pending job instead of historical app
   expect(sent[0]).not.toContain('两张卡片');
 });
 
+it('does not send a separate running message after the original release request gets an approval card', async () => {
+  const { FeishuGateway } = await import('../gateway/gateway');
+  const { ReleaseMaterialsService } = await import('../office/release-materials');
+  const { memoryKeys } = await import('../identity');
+  const sent: string[] = [];
+  const gateway = new FeishuGateway({
+    rawClient: { request: async () => ({ code: 0, data: {} }) },
+    send: async (_chatId: string, payload: { markdown?: string; text?: string }) => { sent.push(payload.markdown ?? payload.text ?? ''); return {}; },
+  } as unknown as LarkChannel);
+  const requester = { userId: 'u-progress', chatId: 'g-progress', chatType: 'group' as const, messageId: 'release-original' };
+  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-progress', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-progress', releaseId: '202611030909', fields: { 负责人: 'Ana' } }, templateFolderToken: 'template-progress', materialsParentToken: 'parent-progress', files: [], ignoredFolders: [] };
+  const { jobId } = await new ReleaseMaterialsService(gateway.office).createJob(requester, manifest);
+  const action = await approvals.proposeAction(requester, { kind: 'release_materials', jobId, releaseId: manifest.input.releaseId, fileCount: 1, fieldSummary: '负责人=Ana' });
+  const db = await store.stateDb();
+  await db.execute({ sql: "UPDATE release_jobs SET status = 'running', approval_id = ? WHERE id = ?", args: [action.id, jobId] });
+  let subscriber: (event: unknown) => void = () => undefined;
+  Reflect.get(gateway, 'sessions').set(memoryKeys(requester).sessionId, {
+    subscribe: (callback: (event: unknown) => void) => { subscriber = callback; return () => undefined; },
+    sendMessage: async () => {
+      subscriber({ type: 'message_update', event: { type: 'text-delta', delta: '下发编号 202611030909 正在执行，请稍后查看确认卡片的最终状态。' } });
+      subscriber({ type: 'agent_end', reason: 'completed' });
+    },
+  });
+  await Reflect.get(gateway, 'runAgent').call(gateway, '新增下发编号 202611030909 的下发材料', requester, requester.messageId);
+  await vi.waitFor(() => expect(Reflect.get(gateway, 'activeRuns').size).toBe(0));
+  expect(sent).toHaveLength(0);
+});
+
 it('reports the completed release when the requester follows up with confirmation', async () => {
   const { FeishuGateway } = await import('../gateway/gateway');
   const { ReleaseMaterialsService } = await import('../office/release-materials');
@@ -524,6 +571,25 @@ it('reports the completed release when the requester follows up with confirmatio
   expect(sent[0]).toContain('202610300857');
   expect(sent[0]).toContain('https://feishu.cn/drive/folder/finished-confirm');
   expect(sent[0]).not.toContain('待审批');
+});
+
+it('keeps a confirmation follow-up quiet while the release progress card is running', async () => {
+  const { FeishuGateway } = await import('../gateway/gateway');
+  const { ReleaseMaterialsService } = await import('../office/release-materials');
+  const sent: string[] = [];
+  const gateway = new FeishuGateway({
+    rawClient: { request: async () => ({ code: 0, data: {} }) },
+    send: async (_chatId: string, payload: { markdown?: string; text?: string }) => { sent.push(payload.markdown ?? payload.text ?? ''); return {}; },
+  } as unknown as LarkChannel);
+  const requester = { userId: 'u-confirm-running', chatId: 'g-confirm-running', chatType: 'group' as const };
+  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-running', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-running', releaseId: '202611030911', fields: {} }, templateFolderToken: 'template-running', materialsParentToken: 'parent-running', files: [], ignoredFolders: [] };
+  const { jobId } = await new ReleaseMaterialsService(gateway.office).createJob(requester, manifest);
+  await (await store.stateDb()).execute({ sql: "UPDATE release_jobs SET status = 'running' WHERE id = ?", args: [jobId] });
+  await gateway.onMessage({ messageId: 'confirm-running', senderId: requester.userId, chatId: requester.chatId, chatType: 'group', content: '确认', mentionedBot: true, rawContentType: 'text', resources: [], mentions: [], mentionAll: false, createTime: Date.now() });
+  expect(sent).toHaveLength(0);
+  await gateway.onMessage({ messageId: 'check-running', senderId: requester.userId, chatId: requester.chatId, chatType: 'group', content: '查看状态', mentionedBot: true, rawContentType: 'text', resources: [], mentions: [], mentionAll: false, createTime: Date.now() });
+  expect(sent).toHaveLength(1);
+  expect(sent[0]).toContain('正在执行');
 });
 
 it('expires an overdue release approval before deciding whether a retry may start', async () => {

@@ -33,6 +33,7 @@ const csv = (value: string) => new Set(value.split(',').map(v => v.trim()).filte
 const modelBaseURL = normalizeChatBaseURL(env.MODEL_PROXY_BASE_URL);
 const usesSiliconFlowCN = new URL(modelBaseURL).hostname === 'api.siliconflow.cn';
 const modelName = normalizeProxyModelName(env.MODEL_PROXY_MODEL);
+const projectRoot = resolve(process.env.AGENT_PROJECT_ROOT ?? process.cwd());
 if (usesSiliconFlowCN && env.MODEL_PROXY_API_KEY && env.SILICONFLOW_CN_API_KEY
   && env.MODEL_PROXY_API_KEY !== env.SILICONFLOW_CN_API_KEY) {
   throw new Error('MODEL_PROXY_API_KEY and SILICONFLOW_CN_API_KEY must match for the SiliconFlow CN model used by Gateway and Studio');
@@ -57,8 +58,8 @@ export const config = {
   studioModelName: usesSiliconFlowCN || env.MODEL_PROXY_MODEL.trim().startsWith('siliconflow-cn/')
     ? `siliconflow-cn/${modelName}` : modelName,
   modelApiKey: env.MODEL_PROXY_API_KEY ?? (usesSiliconFlowCN ? env.SILICONFLOW_CN_API_KEY : undefined),
-  dataDir: resolve(env.AGENT_DATA_DIR),
-  workspaceDir: resolve(env.AGENT_WORKSPACE_DIR),
+  dataDir: resolve(projectRoot, env.AGENT_DATA_DIR),
+  workspaceDir: resolve(projectRoot, env.AGENT_WORKSPACE_DIR),
   mcpServersJson: env.MCP_SERVERS_JSON,
 };
 

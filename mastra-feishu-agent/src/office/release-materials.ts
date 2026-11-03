@@ -18,8 +18,8 @@ export type ReleaseInput = z.infer<typeof releaseInput>;
 export type ReleaseType = 'docx' | 'sheet' | 'bitable';
 export type DriveFile = { token: string; name: string; type: ReleaseType | 'folder' | string; url?: string; modified_time?: string };
 type Patch = { location: string; field: string; before: string; after: string; blockId?: string; elements?: unknown[]; title?: boolean; fileName?: boolean; sheetId?: string; cell?: string; mergeRange?: string; tableId?: string; recordId?: string; fieldName?: string };
-type ScannedFile = DriveFile & { patches: Patch[]; fingerprint: string };
-type ScanResult = { patches: Patch[]; fingerprint: string };
+type ScannedFile = DriveFile & { patches: Patch[]; fingerprint: string; pageTitle?: string };
+type ScanResult = { patches: Patch[]; fingerprint: string; pageTitle?: string };
 export type ReleaseManifest = { input: ReleaseInput; templateFolderToken: string; materialsParentToken: string; files: ScannedFile[]; ignoredFolders: string[]; unusedFields?: string[] };
 const marker = /\{\{([^{}]+)\}\}/g;
 const enc = encodeURIComponent;
@@ -125,6 +125,7 @@ export class ReleaseMaterialsService {
   private async scanDocx(file: DriveFile, fields: Record<string, string>, used: Set<string>): Promise<ScanResult> {
     const patches: Patch[] = [];
     const hash = createHash('sha256');
+    let pageTitle: string | undefined;
     let pageToken: string | undefined;
     let index = 0;
     do {
@@ -133,6 +134,12 @@ export class ReleaseMaterialsService {
       hash.update(JSON.stringify(blocks));
       for (const block of blocks) {
         const location = `块 ${++index}`;
+        if (block.block_type === 1) {
+          const elements = (block.page as { elements?: Array<{ text_run?: { content?: string } }> } | undefined)?.elements;
+          if (Array.isArray(elements) && elements.every(element => typeof element.text_run?.content === 'string')) {
+            pageTitle = elements.map(element => element.text_run!.content).join('');
+          }
+        }
         if (!containsMarker(block)) continue;
         const candidates = Object.entries(block).filter(([, v]) => v && typeof v === 'object' && Array.isArray((v as { elements?: unknown }).elements)) as Array<[string, { elements: Array<Record<string, unknown>> }]>;
         if (candidates.length !== 1 || typeof block.block_id !== 'string') throw new Error(`${file.name} ${location} 的占位符位于不支持的块格式`);
@@ -160,7 +167,7 @@ export class ReleaseMaterialsService {
       pageToken = data.has_more === true ? String(data.page_token ?? '') : undefined;
       if (data.has_more === true && !pageToken) throw new Error('Docx 分页缺少下一页标识');
     } while (pageToken);
-    return { patches, fingerprint: hash.digest('hex') };
+    return { patches, fingerprint: hash.digest('hex'), pageTitle };
   }
 
   private async scanSheet(file: DriveFile, fields: Record<string, string>, used: Set<string>, scopes: SheetScope[] = []): Promise<ScanResult> {
@@ -273,7 +280,7 @@ export class ReleaseMaterialsService {
     return { patches, fingerprint: hash.digest('hex') };
   }
 
-  async scanFile(file: DriveFile, fields: Record<string, string>, used = new Set<string>(), sheetScopes: SheetScope[] = []): Promise<ScannedFile> {
+  async scanFile(file: DriveFile, fields: Record<string, string>, used = new Set<string>(), sheetScopes: SheetScope[] = [], includePageTitle = false): Promise<ScannedFile> {
     let scan: ScanResult;
     try {
       scan = file.type === 'docx' ? await this.scanDocx(file, fields, used)
@@ -288,7 +295,8 @@ export class ReleaseMaterialsService {
       if (after === file.name || after.includes('{{') || after.length > 255) throw new Error(`${file.name} 的文件标题占位符无法安全替换`);
       scan.patches.unshift({ location: '文件标题', field: '标题', before: file.name, after, fileName: true });
     }
-    return { ...file, ...scan };
+    const { pageTitle, ...stableScan } = scan;
+    return { ...file, ...stableScan, ...(includePageTitle ? { pageTitle } : {}) };
   }
 
   async prepare(input: ReleaseInput, caller?: Caller): Promise<ReleaseManifest> {
@@ -306,14 +314,6 @@ export class ReleaseMaterialsService {
     if (templateFolderToken === materialsParentToken) throw new Error('模板目录和材料父目录不能相同');
     const [source, destination] = await Promise.all([this.listFolder(templateFolderToken), this.listFolder(materialsParentToken)]);
     if (destination.some(f => f.name === parsed.releaseId)) throw new Error(`材料父目录已有同名项目“${parsed.releaseId}”，未创建`);
-    if (caller?.chatType === 'group') {
-      const permissions = await this.api.call({ method: 'GET', url: `/open-apis/drive/v1/permissions/${enc(materialsParentToken)}/members`, params: { type: 'folder' } });
-      const members = (permissions.items as Array<{ member_type?: string; member_id?: string; perm?: string }> | undefined) ?? [];
-      const currentGroup = members.filter(member => member.member_type === 'openchat' && member.member_id === caller.chatId);
-      if (currentGroup.length && currentGroup.every(member => member.perm === 'view')) {
-        throw new Error('材料父目录对当前群仅有查看权限；请将该群在材料父目录的权限设为可编辑或可管理后重新发起。尚未发送写入审批卡片。');
-      }
-    }
     const ignoredFolders = source.filter(f => f.type === 'folder').map(f => f.name);
     const files = source.filter(f => f.type !== 'folder');
     if (!files.length) throw new Error('模板文件夹当前层没有可复制的文档');
@@ -364,8 +364,11 @@ export class ReleaseMaterialsService {
       await db.execute({ sql: "UPDATE release_jobs SET status = 'running', folder_token = ?, folder_url = ?, updated_at = ? WHERE id = ?", args: [folder.token, folder.url ?? null, Date.now(), jobId] });
       const resultFiles: Array<{ name: string; url: string }> = [];
       for (const file of manifest.files) {
+        const titlePatch = file.type === 'docx' ? file.patches.find(p => p.title) : undefined;
+        const expectedTitle = titlePatch?.elements?.map(element => (element as { text_run: { content: string } }).text_run.content).join('');
+        const copyName = expectedTitle ?? file.name;
         await db.execute({ sql: "UPDATE release_files SET status = 'copying' WHERE job_id = ? AND source_token = ?", args: [jobId, file.token] });
-        const copy = await this.copyFile(file, folder.token);
+        const copy = await this.copyFile({ ...file, name: copyName }, folder.token);
         await db.execute({ sql: "UPDATE release_files SET status = 'waiting', copy_token = ?, copy_url = ? WHERE job_id = ? AND source_token = ?", args: [copy.token, copy.url ?? null, jobId, file.token] });
         if (!file.patches.length) {
           let visible = false;
@@ -385,19 +388,23 @@ export class ReleaseMaterialsService {
         }
         let scanned: ScannedFile | undefined;
         for (let attempt = 0; attempt < 8; attempt++) {
-          try { scanned = await this.scanFile({ ...file, token: copy.token }, manifest.input.fields, new Set(), manifest.input.sheetScopes); break; }
+          try { scanned = await this.scanFile({ ...file, name: copyName, token: copy.token }, manifest.input.fields, new Set(), manifest.input.sheetScopes, true); break; }
           catch (error) { if (attempt === 7) throw new Error(`副本 ${file.name} 尚不可读或扫描失败：${String(error)}`); await new Promise(resolve => setTimeout(resolve, 500 * (attempt + 1))); }
         }
-        if (!scanned || !same(scanned.patches.map(p => [p.location.replace(/rec[\w]+/, 'record'), p.field, p.before, p.after]), file.patches.map(p => [p.location.replace(/rec[\w]+/, 'record'), p.field, p.before, p.after]))) throw new Error(`副本 ${file.name} 与审批预览不一致，已停止`);
+        const titleAppliedByCopy = !!expectedTitle && scanned?.pageTitle === expectedTitle;
+        const expectedPatches = titleAppliedByCopy ? file.patches.filter(p => !p.title) : file.patches;
+        if (!scanned || !same(scanned.patches.map(p => [p.location.replace(/rec[\w]+/, 'record'), p.field, p.before, p.after]), expectedPatches.map(p => [p.location.replace(/rec[\w]+/, 'record'), p.field, p.before, p.after]))) throw new Error(`副本 ${file.name} 与审批预览不一致，已停止`);
         await db.execute({ sql: "UPDATE release_files SET status = 'writing' WHERE job_id = ? AND source_token = ?", args: [jobId, file.token] });
         await this.writeCopy(scanned, folder.token);
         await this.verifyCopy(scanned, folder.token);
+        if (titleAppliedByCopy) {
+          const post = await this.scanDocx({ ...file, name: copyName, token: copy.token }, manifest.input.fields, new Set());
+          if (post.pageTitle !== expectedTitle) throw new Error(`${file.name} 副本标题回读内容不符，请人工核对`);
+          await this.verifyFolderName(copy.token, folder.token, expectedTitle, file.name);
+        }
         await db.execute({ sql: "UPDATE release_files SET status = 'completed' WHERE job_id = ? AND source_token = ?", args: [jobId, file.token] });
-        const titlePatch = scanned.patches.find(p => p.title);
         const fileNamePatch = scanned.patches.find(p => p.fileName);
-        const name = titlePatch
-          ? titlePatch.elements!.map(element => (element as { text_run: { content: string } }).text_run.content).join('')
-          : fileNamePatch?.after ?? file.name;
+        const name = expectedTitle ?? fileNamePatch?.after ?? file.name;
         resultFiles.push({ name, url: copy.url ?? `${new URL(manifest.input.materialsParentUrl).origin}/${file.type === 'sheet' ? 'sheets' : file.type === 'bitable' ? 'base' : 'docx'}/${copy.token}` });
       }
       const folderUrl = folder.url ?? `${new URL(manifest.input.materialsParentUrl).origin}/drive/folder/${folder.token}`;
@@ -415,14 +422,12 @@ export class ReleaseMaterialsService {
 
   private async writeCopy(file: ScannedFile, folderToken: string): Promise<void> {
     if (file.type === 'sheet') await this.assertSheetMerges(file);
-    const fileNamePatch = file.patches.find(p => p.fileName);
-    if (fileNamePatch) await this.renameFile(file.token, file.type as ReleaseType, folderToken, fileNamePatch.before, fileNamePatch.after);
     if (file.type === 'docx') {
       const titles = file.patches.filter(p => p.title);
       if (titles.length > 1) throw new Error(`${file.name} 有多个标题占位符，无法安全替换`);
       if (titles.length) {
-        const title = titles[0].elements!.map(element => (element as { text_run: { content: string } }).text_run.content).join('');
-        await this.api.call({ method: 'PATCH', url: `/open-apis/drive/v1/files/${enc(file.token)}`, params: { type: 'docx' }, data: { new_title: title } });
+        const title = titles[0];
+        await this.api.call({ method: 'PATCH', url: `/open-apis/docx/v1/documents/${enc(file.token)}/blocks/${enc(title.blockId!)}`, data: { update_text_elements: { elements: title.elements } } });
       }
       const body = file.patches.filter(p => !p.title);
       for (let i = 0; i < body.length; i += 50) {
@@ -432,6 +437,8 @@ export class ReleaseMaterialsService {
       }
       return;
     }
+    const fileNamePatch = file.patches.find(p => p.fileName);
+    if (fileNamePatch) await this.renameFile(file.token, file.type as ReleaseType, folderToken, fileNamePatch.before, fileNamePatch.after);
     if (file.type === 'sheet') {
       for (const patch of file.patches.filter(p => !p.fileName)) await this.api.call({ method: 'PUT', url: `/open-apis/sheets/v2/spreadsheets/${enc(file.token)}/values`, data: { valueRange: { range: `${patch.sheetId}!${patch.cell}:${patch.cell}`, values: [[patch.after]] } } });
       return;
@@ -441,18 +448,33 @@ export class ReleaseMaterialsService {
 
   private async verifyCopy(file: ScannedFile, folderToken: string): Promise<void> {
     if (file.type === 'sheet') await this.assertSheetMerges(file);
+    const docxBlocks = new Map<string, Record<string, unknown>>();
+    if (file.type === 'docx') {
+      let pageToken: string | undefined;
+      do {
+        const data = await this.api.call({ method: 'GET', url: `/open-apis/docx/v1/documents/${enc(file.token)}/blocks`, params: { page_size: 500, ...(pageToken ? { page_token: pageToken } : {}) } });
+        for (const block of (data.items as Array<Record<string, unknown>> | undefined) ?? []) {
+          if (typeof block.block_id === 'string') docxBlocks.set(block.block_id, block);
+        }
+        pageToken = data.has_more === true ? String(data.page_token ?? '') : undefined;
+        if (data.has_more === true && !pageToken) throw new Error('Docx 分页缺少下一页标识');
+      } while (pageToken);
+    }
     for (const patch of file.patches) {
       if (patch.fileName) {
         const actual = (await this.listFolder(folderToken)).find(item => item.token === file.token);
         if (actual?.name !== patch.after) throw new Error(`${file.name} 文件标题回读内容不符，请人工核对`);
       } else if (file.type === 'docx') {
-        const data = await this.api.call({ method: 'GET', url: `/open-apis/docx/v1/documents/${enc(file.token)}/blocks/${enc(patch.blockId!)}` });
-        const block = data.block as Record<string, unknown> | undefined;
+        const block = docxBlocks.get(patch.blockId!);
         const candidates = Object.values(block ?? {}).filter(v => v && typeof v === 'object' && Array.isArray((v as { elements?: unknown }).elements)) as Array<{ elements: unknown[] }>;
         const actual = candidates[0]?.elements;
         const titleMatches = patch.title && actual?.map(element => (element as { text_run?: { content?: string } }).text_run?.content ?? '').join('')
           === patch.elements?.map(element => (element as { text_run?: { content?: string } }).text_run?.content ?? '').join('');
         if (candidates.length !== 1 || !(patch.title ? titleMatches : same(actual, patch.elements))) throw new Error(`${file.name} ${patch.location} 回读内容不符，请人工核对`);
+        if (patch.title) {
+          const expectedName = patch.elements!.map(element => (element as { text_run: { content: string } }).text_run.content).join('');
+          await this.verifyFolderName(file.token, folderToken, expectedName, file.name);
+        }
       } else if (file.type === 'sheet') {
         const range = `${patch.sheetId}!${patch.cell}:${patch.cell}`;
         const data = await this.api.call({ method: 'GET', url: `/open-apis/sheets/v2/spreadsheets/${enc(file.token)}/values/${range}` });
@@ -465,6 +487,16 @@ export class ReleaseMaterialsService {
         if (actual !== patch.after) throw new Error(`${file.name} ${patch.location} 回读内容不符，请人工核对`);
       }
     }
+  }
+
+  private async verifyFolderName(fileToken: string, folderToken: string, expectedName: string, sourceName: string): Promise<void> {
+    let listedName: string | undefined;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      listedName = (await this.listFolder(folderToken)).find(item => item.token === fileToken)?.name;
+      if (listedName === expectedName) return;
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+    }
+    throw new Error(`${sourceName} 文件标题在目录中未更新为“${expectedName}”；请人工核对副本`);
   }
 
   private async assertSheetMerges(file: ScannedFile): Promise<void> {

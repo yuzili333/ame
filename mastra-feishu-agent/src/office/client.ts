@@ -35,6 +35,17 @@ export class OfficeApi {
   constructor(private readonly transport: OfficeTransport) {}
 
   private async api(request: ApiRequest): Promise<Record<string, unknown>> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.requestOnce(request);
+      } catch (error) {
+        if (request.method !== 'GET' || attempt >= 3 || !/^Error: Feishu API 99991400:/.test(String(error))) throw error;
+        await new Promise(resolve => setTimeout(resolve, 500 * 2 ** attempt));
+      }
+    }
+  }
+
+  private async requestOnce(request: ApiRequest): Promise<Record<string, unknown>> {
     let response: ApiResult;
     try {
       response = await this.transport.request(request);

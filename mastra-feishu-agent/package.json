@@ -5,10 +5,11 @@
   "main": "index.js",
   "private": true,
   "scripts": {
-    "dev": "mastra dev",
-    "build": "mastra build",
-    "start": "mastra start",
+    "dev": "node --env-file=.env ./scripts/mastra-cli.mjs dev",
+    "build": "node --env-file=.env ./scripts/mastra-cli.mjs build",
+    "start": "node --env-file=.env ./scripts/mastra-cli.mjs start",
     "gateway": "tsx src/gateway/main.ts",
+    "migrate:traces": "node ./scripts/migrate-traces.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

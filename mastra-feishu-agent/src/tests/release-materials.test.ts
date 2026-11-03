@@ -36,7 +36,7 @@ async function approvedJob(service: InstanceType<typeof ReleaseMaterialsService>
   return jobId;
 }
 
-function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; duplicateFolder?: boolean; failCopy?: boolean; failWrite?: boolean; copyReadDelay?: boolean; formulaMarker?: boolean; ownerTypo?: boolean; docTitleMarker?: boolean; sheetTitleMarker?: boolean; sheetMixedText?: boolean; mergedSheet?: boolean; copyMergeChangesAfterScan?: boolean; plainTemplates?: boolean; parentGroupPerm?: 'view' | 'edit'; failFolderForbidden?: boolean } = {}) {
+function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; duplicateFolder?: boolean; failCopy?: boolean; failWrite?: boolean; copyReadDelay?: boolean; formulaMarker?: boolean; ownerTypo?: boolean; docTitleMarker?: boolean; sheetTitleMarker?: boolean; sheetMixedText?: boolean; mergedSheet?: boolean; copyMergeChangesAfterScan?: boolean; plainTemplates?: boolean; failFolderForbidden?: boolean; privateNoDriveRename?: boolean; privateBatchRejectsPage?: boolean; privateRejectsPagePatch?: boolean; docTitleUpdateDoesNotRenameFile?: boolean; rejectSingleBlockGet?: boolean } = {}) {
   const calls: import('../office/client').ApiRequest[] = [];
   let created = false;
   let sourceReads = 0;
@@ -45,6 +45,7 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
   const originalBaseText = options.plainTemplates ? '普通记录' : '{{负责人}}';
   let docText = originalDocText;
   let copyTitle = options.docTitleMarker ? '说明{{下发编号}}' : '说明.docx';
+  let pageTitle = copyTitle;
   let copySheetName = options.sheetTitleMarker ? '清单{{下发编号}}' : '清单';
   let sheetText = originalSheetText;
   let baseText = originalBaseText;
@@ -52,7 +53,7 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
   let copyReadFailed = false;
   let copySheetQueries = 0;
   const sourceItems = [
-    { token: 'doxcnSource', name: '说明.docx', type: 'docx', modified_time: '1' },
+    { token: 'doxcnSource', name: options.docTitleMarker ? '说明{{下发编号}}' : '说明.docx', type: 'docx', modified_time: '1' },
     { token: 'shtSource', name: options.sheetTitleMarker ? '清单{{下发编号}}' : '清单', type: 'sheet', modified_time: '1' },
     { token: 'child', name: '子目录', type: 'folder' },
   ];
@@ -61,9 +62,6 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
       calls.push(request);
       const url = request.url;
       let data: Record<string, unknown> = {};
-      if (url.includes('/permissions/') && url.endsWith('/members')) {
-        data = { items: [{ member_type: 'openchat', member_id: caller.chatId, perm: options.parentGroupPerm ?? 'edit' }] };
-      } else
       if (url === '/open-apis/drive/v1/files' && request.method === 'GET') {
         const folder = request.params?.folder_token;
         if (folder === 'template') data = request.params?.page_token ? { files: [{ token: options.unsupported ? 'pdf1' : 'baseSource', name: '责任表', type: options.unsupported ? 'file' : 'bitable', modified_time: '1' }], has_more: false } : { files: sourceItems, has_more: true, next_page_token: 'next' };
@@ -81,8 +79,14 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
         const source = url.split('/').at(-2);
         data = { file: { token: source === 'doxcnSource' ? 'doxcnCopy' : source === 'shtSource' ? 'shtCopy' : 'baseCopy' } };
         copied.add((data.file as { token: string }).token);
+        if (source === 'doxcnSource' && !options.docTitleUpdateDoesNotRenameFile) {
+          copyTitle = (request.data as { name: string }).name;
+          pageTitle = copyTitle;
+        }
       } else if (url === '/open-apis/drive/v1/files/doxcnCopy' && request.method === 'PATCH') {
+        if (options.privateNoDriveRename) throw new Error('This private Feishu deployment does not provide PATCH /open-apis/drive/v1/files/:id');
         copyTitle = (request.data as { new_title: string }).new_title;
+        pageTitle = copyTitle;
       } else if (url === '/open-apis/drive/v1/files/shtCopy' && request.method === 'PATCH') {
         copySheetName = (request.data as { new_title: string }).new_title;
       } else if (url.includes('/docx/v1/documents/') && url.endsWith('/blocks') && request.method === 'GET') {
@@ -90,19 +94,33 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
         if (isCopy && options.copyReadDelay && !copyReadFailed) { copyReadFailed = true; throw new Error('not ready'); }
         if (!isCopy && options.sourceChanged && ++sourceReads > 1) docText = '{{下发编号}} / {{负责人}} / 变更';
         const items: Array<Record<string, unknown>> = [{ block_id: isCopy ? 'blockCopy' : 'blockSource', block_type: 2, text: { elements: [{ text_run: { content: isCopy ? docText.replace('{{下发编号}}', created ? '20261029' : '{{下发编号}}') : docText } }] } }];
-        if (options.docTitleMarker) items.unshift({ block_id: isCopy ? 'doxcnCopy' : 'doxcnSource', block_type: 1, page: { elements: [{ text_run: { content: isCopy ? copyTitle : '说明{{下发编号}}' } }] } });
+        if (options.docTitleMarker) items.unshift({ block_id: isCopy ? 'doxcnCopy' : 'doxcnSource', block_type: 1, page: { elements: [{ text_run: { content: isCopy ? pageTitle : '说明{{下发编号}}' } }] } });
         data = { items, has_more: false };
         // The copy starts from the original marker text until the batch update below.
         if (isCopy && !docWritten) (items.find(item => item.block_type === 2) as { text: { elements: Array<{ text_run: { content: string } }> } }).text.elements[0].text_run.content = originalDocText;
       } else if (url.endsWith('/blocks/batch_update')) {
         if (options.failWrite) throw new Error('write timeout');
-        const req = (request.data as { requests: Array<{ update_text_elements: { elements: Array<{ text_run: { content: string } }> } }> }).requests;
-        docText = req[0].update_text_elements.elements[0].text_run.content;
+        const req = (request.data as { requests: Array<{ block_id: string; update_text_elements: { elements: Array<{ text_run: { content: string } }> } }> }).requests;
+        if (options.privateBatchRejectsPage && req.some(patch => patch.block_id === 'doxcnCopy')) throw new Error('Feishu API 1770001: invalid param');
+        for (const patch of req) {
+          const value = patch.update_text_elements.elements.map(element => element.text_run.content).join('');
+          if (patch.block_id === 'doxcnCopy') {
+            pageTitle = value;
+            if (!options.docTitleUpdateDoesNotRenameFile) copyTitle = value;
+          }
+          else docText = value;
+        }
         docWritten = true;
+      } else if (url.endsWith('/blocks/doxcnCopy') && request.method === 'PATCH') {
+        if (options.privateRejectsPagePatch) throw new Error('Feishu API 1770001: invalid param');
+        pageTitle = (request.data as { update_text_elements: { elements: Array<{ text_run: { content: string } }> } }).update_text_elements.elements.map(element => element.text_run.content).join('');
+        if (!options.docTitleUpdateDoesNotRenameFile) copyTitle = pageTitle;
+      } else if (options.rejectSingleBlockGet && request.method === 'GET' && /\/docx\/v1\/documents\/[^/]+\/blocks\/[^/]+$/.test(url)) {
+        return { code: 99991400, msg: 'request trigger frequency limit' };
       } else if (url.includes('/docx/v1/documents/') && url.includes('/blocks/blockCopy')) {
         data = { block: { block_id: 'blockCopy', text: { elements: [{ text_run: { content: docText } }] } } };
       } else if (url.endsWith('/blocks/doxcnCopy')) {
-        data = { block: { block_id: 'doxcnCopy', block_type: 1, page: { elements: [{ text_run: { content: copyTitle } }] } } };
+        data = { block: { block_id: 'doxcnCopy', block_type: 1, page: { elements: [{ text_run: { content: pageTitle } }] } } };
       } else if (url.includes('/sheets/query')) {
         const isCopy = url.includes('shtCopy');
         if (isCopy) copySheetQueries++;
@@ -130,7 +148,8 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
     send: async () => undefined,
   };
   let docWritten = false;
-  return { service: new ReleaseMaterialsService(new OfficeApi(transport)), calls };
+  const api = new OfficeApi(transport);
+  return { service: new ReleaseMaterialsService(api), api, calls };
 }
 
 describe('release materials', () => {
@@ -168,6 +187,33 @@ describe('release materials', () => {
     expect(calls.filter(c => c.url === '/open-apis/drive/v1/files' && c.params?.folder_token === 'template')).toHaveLength(2);
   });
 
+  it('sends one bounded release summary without document bodies or patch JSON', async () => {
+    const { api } = fixture();
+    const { requestReleaseMaterials } = await import('../mastra/tools/office-tools');
+    const { setOfficeApi, setOfficeTextSender } = await import('../runtime/office-bridge');
+    const { setApprovalNotifier } = await import('../runtime/approval-bridge');
+    const messages: string[] = [];
+    const cards: string[] = [];
+    setOfficeApi(api);
+    setOfficeTextSender(async (_chatId, text) => { messages.push(text); });
+    setApprovalNotifier(async (_chatId, _actionId, summary) => { cards.push(summary); });
+    try {
+      const result = await requestReleaseMaterials({ ...input, releaseId: '20261103' }, caller);
+      expect(result.status).toBe('pending');
+      expect(messages).toHaveLength(1);
+      expect(messages[0].length).toBeLessThan(2801);
+      expect(messages[0]).toContain('3 个副本');
+      expect(messages[0]).toContain('说明.docx（docx）：1 处');
+      expect(messages[0]).not.toContain('text_run');
+      expect(messages[0]).not.toContain('"elements"');
+      expect(cards).toHaveLength(1);
+    } finally {
+      setApprovalNotifier(undefined);
+      setOfficeTextSender(undefined);
+      setOfficeApi(undefined);
+    }
+  });
+
   it('accepts supplied fields absent from the template and reports them as unused', async () => {
     const { service, calls } = fixture();
     const manifest = await service.prepare({ ...input, fields: { ...input.fields, 下发日期: '20261030' } });
@@ -175,10 +221,29 @@ describe('release materials', () => {
     expect(calls.every(call => !JSON.stringify(call).includes('下发日期'))).toBe(true);
   });
 
-  it('stops before approval when the request group can only view the destination folder', async () => {
-    const { service, calls } = fixture({ parentGroupPerm: 'view' });
-    await expect(service.prepare(input, caller)).rejects.toThrow('仅有查看权限');
-    expect(calls.some(c => c.method !== 'GET')).toBe(false);
+  it('does not query unsupported folder-member APIs in a group preflight', async () => {
+    const { service, calls } = fixture();
+    const manifest = await service.prepare(input, caller);
+    expect(manifest.files).toHaveLength(3);
+    expect(calls.some(call => call.url.includes('/permissions/'))).toBe(false);
+    expect(calls.every(call => call.method === 'GET')).toBe(true);
+  });
+
+  it('logs a redacted tool preflight failure with release ID and chat type', async () => {
+    const { api } = fixture({ duplicateFolder: true });
+    const { setOfficeApi } = await import('../runtime/office-bridge');
+    const { requestReleaseMaterials } = await import('../mastra/tools/office-tools');
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    setOfficeApi(api);
+    try {
+      await expect(requestReleaseMaterials(input, caller)).rejects.toThrow('已有同名');
+      const line = log.mock.calls.map(args => args.join(' ')).join('\n');
+      expect(line).toContain('[prepareReleaseMaterialsTool] failed');
+      expect(line).toContain('"phase":"preflight"');
+      expect(line).toContain('20261029');
+      expect(line).toContain('group');
+      expect(line).not.toContain(input.materialsParentUrl);
+    } finally { log.mockRestore(); setOfficeApi(undefined); }
   });
 
   it('creates one folder, copies each file, replaces only copies, and rejects a replay', async () => {
@@ -205,17 +270,57 @@ describe('release materials', () => {
     expect(calls.filter(call => ['PATCH', 'PUT'].includes(call.method))).toHaveLength(0);
   });
 
-  it('updates a Docx page title through Drive while keeping it out of the Docx body batch', async () => {
-    const { service, calls } = fixture({ docTitleMarker: true });
+  it('updates a Docx page title and body without private Drive PATCH', async () => {
+    const { service, calls } = fixture({ docTitleMarker: true, privateNoDriveRename: true });
     const manifest = await service.prepare(input);
     expect(manifest.files[0].patches).toHaveLength(2);
     const jobId = await approvedJob(service, manifest);
     const result = await service.executeJob(jobId);
     expect(result.files[0].name).toBe('说明20261029');
-    const rename = calls.find(c => c.url === '/open-apis/drive/v1/files/doxcnCopy' && c.method === 'PATCH');
-    expect(rename).toMatchObject({ params: { type: 'docx' }, data: { new_title: '说明20261029' } });
+    expect(calls.some(c => c.url === '/open-apis/drive/v1/files/doxcnCopy' && c.method === 'PATCH')).toBe(false);
+    expect(calls.some(c => c.url.endsWith('/blocks/doxcnCopy') && c.method === 'PATCH')).toBe(false);
     const batch = calls.find(c => c.url.endsWith('/blocks/batch_update'));
     expect((batch?.data as { requests: Array<{ block_id: string }> }).requests.map(r => r.block_id)).toEqual(['blockCopy']);
+  });
+
+  it('verifies Docx replacements without the rate-limited single-block GET endpoint', async () => {
+    const { service, calls } = fixture({ docTitleMarker: true, rejectSingleBlockGet: true });
+    const manifest = await service.prepare(input);
+    const result = await service.executeJob(await approvedJob(service, manifest));
+    expect(result.files[0].name).toBe('说明20261029');
+    expect(calls.filter(call => call.method === 'GET' && /\/docx\/v1\/documents\/[^/]+\/blocks\/[^/]+$/.test(call.url))).toHaveLength(0);
+  });
+
+  it('does not report success when a private Docx title update does not change the Drive file name', async () => {
+    const { service } = fixture({ docTitleMarker: true, privateNoDriveRename: true, docTitleUpdateDoesNotRenameFile: true });
+    const manifest = await service.prepare(input);
+    const jobId = await approvedJob(service, manifest);
+    await expect(service.executeJob(jobId)).rejects.toThrow('文件标题');
+    const row = (await (await stateDb()).execute({ sql: 'SELECT status FROM release_jobs WHERE id = ?', args: [jobId] })).rows[0];
+    expect(row.status).toBe('needs_review');
+  });
+
+  it('copies a Docx under the final title when private APIs reject Page updates', async () => {
+    const { service, calls } = fixture({ docTitleMarker: true, privateNoDriveRename: true, privateBatchRejectsPage: true, privateRejectsPagePatch: true });
+    const manifest = await service.prepare(input);
+    const result = await service.executeJob(await approvedJob(service, manifest));
+    expect(result.files[0].name).toBe('说明20261029');
+    expect(calls.find(call => call.url.endsWith('/doxcnSource/copy'))?.data).toMatchObject({ name: '说明20261029' });
+    expect(calls.filter(call => call.url.endsWith('/blocks/doxcnCopy') && call.method === 'PATCH')).toHaveLength(0);
+    expect(calls.filter(call => call.url.endsWith('/blocks/batch_update')).every(call =>
+      (call.data as { requests: Array<{ block_id: string }> }).requests.every(request => request.block_id !== 'doxcnCopy'))).toBe(true);
+  });
+
+  it('executes a previously approved manifest without the new Docx page title scan metadata', async () => {
+    const { service } = fixture({ docTitleMarker: true });
+    const manifest = await service.prepare(input);
+    const jobId = await approvedJob(service, manifest);
+    const db = await stateDb();
+    const stored = JSON.parse(String((await db.execute({ sql: 'SELECT manifest_json FROM release_jobs WHERE id = ?', args: [jobId] })).rows[0].manifest_json)) as typeof manifest;
+    for (const file of stored.files) delete file.pageTitle;
+    await db.execute({ sql: 'UPDATE release_jobs SET manifest_json = ? WHERE id = ?', args: [JSON.stringify(stored), jobId] });
+    const result = await service.executeJob(jobId);
+    expect(result.files[0].name).toBe('说明20261029');
   });
 
   it('previews and renames a copied Sheets file title without changing the template', async () => {

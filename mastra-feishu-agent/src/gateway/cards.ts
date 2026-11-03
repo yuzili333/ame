@@ -36,3 +36,20 @@ export function resolvedCard(status: string, detail?: string) {
     body: { elements: [{ tag: 'markdown', content: `${labels[status] ?? status}${detail ? `\n\n${detail}` : ''}` }] },
   };
 }
+
+export type ReleaseFileProgress = { name: string; status: string };
+
+export function releaseProgressCard(status: string, releaseId: string, files: ReleaseFileProgress[], detail?: string) {
+  const finished = status === 'succeeded' || status === 'failed' || status === 'interrupted';
+  const label = (fileStatus: string) => {
+    if (fileStatus === 'completed') return '更新成功';
+    if (fileStatus === 'uncertain' || fileStatus === 'failed') return '更新失败（结果需核对）';
+    if (finished) return fileStatus === 'pending' ? '未执行' : '更新失败（结果需核对）';
+    return fileStatus === 'pending' ? '待更新' : '更新中';
+  };
+  const lines = files.map(file => `- ${file.name.replace(/[\r\n]/g, ' ')}：${label(file.status)}`);
+  const progress = `下发编号 ${releaseId}\n文件处理进度（${files.filter(file => file.status === 'completed').length}/${files.length}）：\n${lines.join('\n')}`;
+  const card = resolvedCard(status, progress);
+  if (detail) card.body.elements.push({ tag: 'markdown', content: detail });
+  return card;
+}

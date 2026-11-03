@@ -1,4 +1,4 @@
-import { createLarkChannel, type CardActionEvent, type EventDispatcher, type LarkChannel, type NormalizedMessage } from '@larksuiteoapi/node-sdk';
+import { createLarkChannel, normalizeCardAction, type CardActionEvent, type EventDispatcher, type LarkChannel, type NormalizedMessage, type RawCardActionEvent } from '@larksuiteoapi/node-sdk';
 import { RequestContext } from '@mastra/core/request-context';
 import type { Server } from 'node:http';
 import { z } from 'zod';
@@ -19,7 +19,7 @@ import { setApprovalNotifier } from '../runtime/approval-bridge';
 import { setOfficeApi, setOfficeTextSender } from '../runtime/office-bridge';
 import { APPROVAL_TTL_MS, decideAction, expireAction, proposeAction } from '../state/approvals';
 import { getAction, isMessageRecalled, markMessageSeen, recoverInterruptedApprovals, recoverInterruptedWorkflows, stateDb } from '../state/store';
-import { approvalCard, cardDecision, resolvedCard } from './cards';
+import { approvalCard, cardDecision, releaseProgressCard, resolvedCard, type ReleaseFileProgress } from './cards';
 import { safeSdkLogger } from './safe-sdk-logger';
 
 type Session = Awaited<ReturnType<typeof controller.createSession>>;
@@ -78,9 +78,12 @@ export class FeishuGateway {
     dispatcher.register({ 'im.message.recalled_v1': event => {
       if (event.message_id && event.chat_id) void this.onMessageRecalled({ messageId: event.message_id, chatId: event.chat_id }).catch(error => this.report(error));
     } });
-    this.channel.on('cardAction', event => { void this.onCardAction(event).catch(error => this.report(error)); });
     this.channel.on('error', error => this.report(error));
     await this.channel.connect();
+    // connect() installs the SDK's default card handler. Replace it afterwards:
+    // it discards return values and no Channel cardAction listener is attached.
+    dispatcher.unregister('card.action.trigger');
+    dispatcher.register({ 'card.action.trigger': (raw: RawCardActionEvent) => this.ackCardAction(raw) } as unknown as Parameters<EventDispatcher['register']>[0]);
     await (await stateDb()).execute({ sql: "UPDATE queued_messages SET status = 'interrupted' WHERE status = 'running'" });
     const pendingChats = (await (await stateDb()).execute({ sql: "SELECT DISTINCT chat_id FROM queued_messages WHERE status = 'pending'" })).rows;
     for (const row of pendingChats) void this.drainQueue(String(row.chat_id)).catch(error => this.report(error));
@@ -100,6 +103,56 @@ export class FeishuGateway {
 
   private report(error: unknown) {
     console.error(error instanceof Error ? error.message : String(error));
+  }
+
+  async ackCardAction(raw: RawCardActionEvent) {
+    console.info('[Feishu card action] callback delivered');
+    const event = normalizeCardAction(raw);
+    if (!event) {
+      console.warn('[Feishu card action] missing context', JSON.stringify({
+        messageId: Boolean(raw.context?.open_message_id || raw.open_message_id),
+        chatId: Boolean(raw.context?.open_chat_id || raw.open_chat_id),
+        operatorOpenId: Boolean(raw.operator?.open_id),
+      }));
+      return { toast: { type: 'error', content: '卡片回调缺少会话或操作人信息；请联系管理员查看网关日志。' } };
+    }
+    const value = cardDecision.safeParse(event.action.value);
+    if (!value.success) return { toast: { type: 'error', content: '卡片参数无效，请重新发起操作。' } };
+    let stored: Awaited<ReturnType<typeof getAction>>;
+    try { stored = await getAction(value.data.approvalId); }
+    catch (error) {
+      console.error('[Feishu card action] approval lookup failed', error instanceof Error ? error.message : String(error));
+      return { toast: { type: 'error', content: '审批状态暂时无法读取；请联系管理员查看网关日志。' } };
+    }
+    if (!stored) return { toast: { type: 'error', content: '审批记录不存在或已失效。' } };
+    if (stored.chat_id !== event.chatId || stored.requester_id !== event.operator.openId
+      || (stored.card_message_id && stored.card_message_id !== event.messageId)
+      || !isAuthorizedCaller({ userId: event.operator.openId, chatId: event.chatId, chatType: stored.chat_type ?? 'p2p' })
+      || (stored.kind === 'message_send' && !config.allowedUsers.has(event.operator.openId))) {
+      return { toast: { type: 'error', content: '仅原请求者可确认此操作。' } };
+    }
+    if (stored.status !== 'pending') {
+      if (stored.kind === 'release_materials') return { toast: { type: 'info', content: '此批次已处理；请查看卡片当前进度与最终结果。' } };
+      return { card: { type: 'raw', data: resolvedCard(stored.status, '此操作已处理；请查看网关日志与 Trace 核对最终结果。') } };
+    }
+    console.info('Feishu card callback received', JSON.stringify({ approvalId: value.data.approvalId, decision: value.data.decision }));
+    void this.onCardAction(event).catch(error => console.error('[Feishu card action] failed', {
+      approvalId: value.data.approvalId,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+    // The SDK sends this card as the callback response before the async workflow finishes.
+    const status = value.data.decision === 'approve' ? 'executing' : 'denied';
+    const detail = value.data.decision === 'approve' ? '已收到操作，正在核验审批并执行；结果会更新在本卡片。' : '已收到拒绝操作。';
+    if (stored.kind === 'release_materials') {
+      try {
+        const action = officeAction.parse(JSON.parse(stored.payload));
+        if (action.kind === 'release_materials') {
+          const progress = await this.releaseProgress(action.jobId);
+          return { card: { type: 'raw', data: releaseProgressCard(status, progress.releaseId, progress.files, detail) } };
+        }
+      } catch (error) { this.report(error); }
+    }
+    return { card: { type: 'raw', data: resolvedCard(status, detail) } };
   }
 
   private serialize(chatId: string, job: () => Promise<void>): Promise<void> {
@@ -207,6 +260,7 @@ export class FeishuGateway {
       if (releaseStatusFollowup.test(content)) {
         const latest = await this.latestReleaseJob(caller);
         if (latest && Date.now() - latest.createdAt < APPROVAL_TTL_MS) {
+          if (['running', 'creating_folder'].includes(latest.status) && !/(?:查看|核对|检查)/.test(content)) return;
           await this.channel.send(caller.chatId, { markdown: this.releaseJobMessage(latest) }, { replyTo: message.messageId });
           return;
         }
@@ -232,10 +286,10 @@ export class FeishuGateway {
     }
   }
 
-  private async latestReleaseJob(caller: Caller): Promise<{ id: string; status: string; manifest: ReleaseManifest; approvalId?: string; createdAt: number; folderUrl?: string; result?: { folderUrl: string; files: Array<{ name: string; url: string }> } } | null> {
+  private async latestReleaseJob(caller: Caller): Promise<{ id: string; status: string; manifest: ReleaseManifest; approvalId?: string; originMessageId?: string; createdAt: number; folderUrl?: string; result?: { folderUrl: string; files: Array<{ name: string; url: string }> } } | null> {
     if (!caller.userId || !caller.chatId) return null;
     const row = (await (await stateDb()).execute({
-      sql: 'SELECT id, status, manifest_json, approval_id, created_at, folder_url, result_json FROM release_jobs WHERE requester_id = ? AND chat_id = ? ORDER BY created_at DESC LIMIT 1',
+      sql: 'SELECT id, status, manifest_json, approval_id, origin_message_id, created_at, folder_url, result_json FROM release_jobs WHERE requester_id = ? AND chat_id = ? ORDER BY created_at DESC LIMIT 1',
       args: [caller.userId, caller.chatId],
     })).rows[0];
     if (!row) return null;
@@ -249,8 +303,48 @@ export class FeishuGateway {
       }
     }
     return { id: String(row.id), status, manifest: JSON.parse(String(row.manifest_json)) as ReleaseManifest, approvalId,
+      originMessageId: typeof row.origin_message_id === 'string' ? row.origin_message_id : undefined,
       createdAt: Number(row.created_at), folderUrl: typeof row.folder_url === 'string' ? row.folder_url : undefined,
       result: typeof row.result_json === 'string' ? JSON.parse(row.result_json) as { folderUrl: string; files: Array<{ name: string; url: string }> } : undefined };
+  }
+
+  private async releaseProgress(jobId: string): Promise<{ releaseId: string; jobStatus: string; files: ReleaseFileProgress[] }> {
+    const db = await stateDb();
+    const job = (await db.execute({ sql: 'SELECT status, manifest_json FROM release_jobs WHERE id = ?', args: [jobId] })).rows[0];
+    if (!job) throw new Error('下发批次不存在，无法展示处理进度');
+    const manifest = JSON.parse(String(job.manifest_json)) as ReleaseManifest;
+    const rows = (await db.execute({ sql: 'SELECT source_token, status FROM release_files WHERE job_id = ?', args: [jobId] })).rows;
+    const byToken = new Map(rows.map(row => [String(row.source_token), String(row.status)]));
+    return { releaseId: manifest.input.releaseId, jobStatus: String(job.status),
+      files: manifest.files.map(file => ({ name: file.name, status: byToken.get(file.token) ?? 'pending' })) };
+  }
+
+  private watchReleaseProgress(jobId: string, messageId: string): () => Promise<void> {
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let active: Promise<void> = Promise.resolve();
+    let previous = '';
+    const tick = () => {
+      active = (async () => {
+        const progress = await this.releaseProgress(jobId);
+        const status = progress.jobStatus === 'completed' ? 'succeeded'
+          : ['failed', 'needs_review'].includes(progress.jobStatus) ? 'failed' : 'executing';
+        const card = releaseProgressCard(status, progress.releaseId, progress.files);
+        const signature = JSON.stringify(card);
+        if (signature !== previous) {
+          await this.channel.updateCard(messageId, card);
+          previous = signature;
+        }
+      })().catch(error => this.report(error)).finally(() => {
+        if (!stopped) {
+          timer = setTimeout(tick, 750);
+          timer.unref();
+        }
+      });
+    };
+    timer = setTimeout(tick, 750);
+    timer.unref();
+    return async () => { stopped = true; if (timer) clearTimeout(timer); await active; };
   }
 
   private releaseJobMessage(job: NonNullable<Awaited<ReturnType<FeishuGateway['latestReleaseJob']>>>): string {
@@ -358,7 +452,9 @@ export class FeishuGateway {
         if (sendReply && !cancelled && !(await isMessageRecalled(replyTo)) && reply.trim() && await latestPermissionRequestId(caller) === permissionRequestBefore) {
           let outgoing = reply;
           const latestRelease = await this.latestReleaseJob(caller);
-          if (latestRelease && content.includes(latestRelease.manifest.input.releaseId) && /下发/.test(content)) {
+          if (latestRelease?.originMessageId === replyTo && latestRelease.approvalId) {
+            outgoing = '';
+          } else if (latestRelease && content.includes(latestRelease.manifest.input.releaseId) && /下发/.test(content)) {
             outgoing = this.releaseJobMessage(latestRelease);
           } else if (latestRelease && content.includes(latestRelease.manifest.input.releaseId)
             && ['failed', 'denied', 'expired'].includes(latestRelease.status)
@@ -367,7 +463,7 @@ export class FeishuGateway {
             const state = latestRelease.status === 'failed' ? '失败' : latestRelease.status === 'denied' ? '被拒绝' : '已过期';
             outgoing = `此前批次已${state}，旧审批卡片不再有效，也没有新的待审批批次。${caller.chatType === 'group' ? '请在群里发送“@机器人 重新发起”' : '请回复“重新发起”'}，我会重新预检并在有权限时发送新卡片。`;
           }
-          if (!cancelled && !(await isMessageRecalled(replyTo))) await this.channel.send(caller.chatId, { markdown: outgoing }, { replyTo });
+          if (outgoing.trim() && !cancelled && !(await isMessageRecalled(replyTo))) await this.channel.send(caller.chatId, { markdown: outgoing }, { replyTo });
         }
       } finally {
         this.activeRuns.delete(sessionId);
@@ -457,30 +553,36 @@ export class FeishuGateway {
     const value = cardDecision.safeParse(event.action.value);
     if (!value.success) return;
     const stored = await getAction(value.data.approvalId);
-    if (!stored || stored.chat_id !== event.chatId) return;
+    if (!stored || stored.chat_id !== event.chatId || (stored.card_message_id && stored.card_message_id !== event.messageId)) return;
     // Older approvals have no chat_type and retain the original chat allowlist check.
     if (!isAuthorizedCaller({ userId: event.operator.openId, chatId: event.chatId, chatType: stored.chat_type ?? 'p2p' })) return;
     if (stored.kind === 'message_send' && !config.allowedUsers.has(event.operator.openId)) return;
-    const decision = await decideAction(value.data.approvalId, {
-      userId: event.operator.openId, chatId: event.chatId,
-    }, value.data.decision === 'approve', async (action, key) => {
-      if (action.kind === 'release_materials') {
-        await this.channel.updateCard(event.messageId, resolvedCard('executing', `正在生成 ${action.releaseId} 的 ${action.fileCount} 个文件`));
-        const run = await releaseMaterialsWorkflow.createRun();
-        await (await stateDb()).execute({ sql: 'UPDATE release_jobs SET run_id = ? WHERE id = ?', args: [run.runId, action.jobId] });
-        const outcome = await run.start({ inputData: { jobId: action.jobId } });
-        if (outcome.status !== 'success') throw new Error(`下发材料 Workflow 结束状态：${outcome.status}`);
-        return outcome.result;
-      }
-      const token = 'permissionMode' in action && action.permissionMode === 'user'
-        ? await userAccessToken(event.operator.openId,
-          action.kind.startsWith('sheet_') || action.kind.startsWith('bitable_') ? config.tableOAuthScopes : []) : undefined;
-      return this.office.execute(action, key, token ?? undefined);
-    }, async (stored, approved) => {
-      const session = stored.session_id ? this.sessions.get(stored.session_id) : undefined;
-      if (!session || !stored.tool_call_id) throw new Error('Original agent tool run has expired');
-      await session.respondToToolApproval({ toolCallId: stored.tool_call_id, decision: approved ? 'approve' : 'decline' });
-    });
+    const releaseAction = stored.kind === 'release_materials' ? officeAction.parse(JSON.parse(stored.payload)) : undefined;
+    const stopProgress = releaseAction?.kind === 'release_materials' && value.data.decision === 'approve' && stored.status === 'pending'
+      ? this.watchReleaseProgress(releaseAction.jobId, event.messageId) : undefined;
+    let decision: Awaited<ReturnType<typeof decideAction>>;
+    try {
+      decision = await decideAction(value.data.approvalId, {
+        userId: event.operator.openId, chatId: event.chatId,
+      }, value.data.decision === 'approve', async (action, key) => {
+        if (action.kind === 'release_materials') {
+          const run = await releaseMaterialsWorkflow.createRun();
+          await (await stateDb()).execute({ sql: 'UPDATE release_jobs SET run_id = ? WHERE id = ?', args: [run.runId, action.jobId] });
+          const outcome = await run.start({ inputData: { jobId: action.jobId } });
+          if (outcome.status !== 'success') throw new Error(`下发材料 Workflow 结束状态：${outcome.status}`);
+          return outcome.result;
+        }
+        const token = 'permissionMode' in action && action.permissionMode === 'user'
+          ? await userAccessToken(event.operator.openId,
+            action.kind.startsWith('sheet_') || action.kind.startsWith('bitable_') ? config.tableOAuthScopes : []) : undefined;
+        return this.office.execute(action, key, token ?? undefined);
+      }, async (stored, approved) => {
+        const session = stored.session_id ? this.sessions.get(stored.session_id) : undefined;
+        if (!session || !stored.tool_call_id) throw new Error('Original agent tool run has expired');
+        await session.respondToToolApproval({ toolCallId: stored.tool_call_id, decision: approved ? 'approve' : 'decline' });
+      });
+    } finally { await stopProgress?.(); }
+    console.info('[Feishu card action] decision', JSON.stringify({ approvalId: value.data.approvalId, status: decision.status, kind: stored.kind }));
     if (stored.kind === 'release_materials' && (decision.status === 'denied' || decision.status === 'expired')) {
       const action = officeAction.parse(JSON.parse(stored.payload));
       if (action.kind === 'release_materials') await (await stateDb()).execute({ sql: "UPDATE release_jobs SET status = ?, updated_at = ? WHERE id = ? AND status = 'pending'", args: [decision.status, Date.now(), action.jobId] });
@@ -503,18 +605,12 @@ export class FeishuGateway {
           detail += `\n\n原因：${job?.error ?? '请检查 Workflow trace'}\n已生成的文件夹：${job?.folder_url ?? job?.folder_token ?? '无'}\n副本：${copies.filter(row => row.copy_token).map(row => `${row.source_name}（${row.status}）：${row.copy_url ?? row.copy_token}`).join('；') || '无'}\n${knownCreateDenial ? '创建文件夹被飞书拒绝，未产生材料。请检查应用 Drive 写入权限及材料父目录对当前群的可编辑或可管理权限，修正后重新发起。' : '请人工核对，系统不会自动重试或删除。'}`;
         }
       }
-      if (detail && detail.length > 3000) {
-        const full = detail;
-        try {
-          for (let offset = 0; offset < full.length; offset += 3000) await this.channel.send(event.chatId, { markdown: full.slice(offset, offset + 3000) });
-          detail = '完整文件清单及状态已分条发送到当前会话。';
-        } catch (error) {
-          this.report(error);
-          detail = `${full.slice(0, 2800)}\n\n详情消息发送失败，请在 Studio trace 和状态库中核对。`;
-        }
-      }
+      if (detail && detail.length > 2800) detail = `${detail.slice(0, 2700)}\n\n详情请在网关日志、Trace 和状态库中核对。`;
       const displayStatus = decision.action.kind === 'mastra_tool' && decision.status === 'succeeded' ? 'resumed' : decision.status;
-      await this.channel.updateCard(event.messageId, resolvedCard(displayStatus, detail));
+      if (releaseAction?.kind === 'release_materials') {
+        const progress = await this.releaseProgress(releaseAction.jobId);
+        await this.channel.updateCard(event.messageId, releaseProgressCard(displayStatus, progress.releaseId, progress.files, detail));
+      } else await this.channel.updateCard(event.messageId, resolvedCard(displayStatus, detail));
     }
   }
 

@@ -1,9 +1,8 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { Mastra } from '@mastra/core/mastra';
-import { AgentController } from '@mastra/core/agent-controller';
+import { AgentController, type AvailableModel } from '@mastra/core/agent-controller';
 import { LibSQLStore } from '@mastra/libsql';
-import { DuckDBStore } from '@mastra/duckdb';
 import { MastraCompositeStore } from '@mastra/core/storage';
 import { MastraStorageExporter, Observability, SensitiveDataFilter } from '@mastra/observability';
 import { config } from '../config';
@@ -16,8 +15,22 @@ import { startScheduleTool, stopScheduleTool } from './tools/schedule-tools';
 mkdirSync(config.dataDir, { recursive: true });
 mkdirSync(config.workspaceDir, { recursive: true });
 const storageUrl = `file:${join(config.dataDir, 'mastra.db')}`;
+const traceStorageUrl = `file:${join(config.dataDir, 'traces.db')}`;
 
-export const controller = new AgentController({
+class IntranetAgentController extends AgentController {
+  override async listAvailableModels(): Promise<AvailableModel[]> {
+    // The default controller catalog fetches public gateways even when MASTRA_OFFLINE=1.
+    return [{
+      id: config.studioModelName,
+      provider: config.studioModelName.startsWith('siliconflow-cn/') ? 'siliconflow-cn' : 'enterprise-proxy',
+      modelName: config.modelName,
+      hasApiKey: true,
+      useCount: 0,
+    }];
+  }
+}
+
+export const controller = new IntranetAgentController({
   id: 'office-controller',
   agent,
   storage: new LibSQLStore({ id: 'controller-storage', url: storageUrl }),
@@ -39,9 +52,9 @@ export const mastra = new Mastra({
   storage: new MastraCompositeStore({
     id: 'composite-storage',
     default: new LibSQLStore({ id: 'mastra-storage', url: storageUrl }),
-    domains: { observability: await new DuckDBStore().getStore('observability') },
+    domains: { observability: await new LibSQLStore({ id: 'trace-storage', url: traceStorageUrl }).getStore('observability') },
   }),
   observability: new Observability({
-    configs: { default: { serviceName: 'feishu-office-agent', exporters: [new MastraStorageExporter()], spanOutputProcessors: [new SensitiveDataFilter()] } },
+    configs: { default: { serviceName: 'feishu-office-agent', exporters: [new MastraStorageExporter()], spanOutputProcessors: [new SensitiveDataFilter()], logging: { enabled: false } } },
   }),
 });

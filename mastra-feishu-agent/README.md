@@ -6,7 +6,7 @@
 
 1. Windows 11 云桌面安装 Node.js 22.13+ 和 npm，在本目录执行 `npm ci`。
 2. 复制 `.env.example` 为 `.env` 并填写飞书应用 ID、密钥、私有化域名、模型代理 URL 与模型名。`FEISHU_DOMAIN` 为完整的 `https://` 内网域名；`MODEL_PROXY_BASE_URL` 填 API 基础路径（例如 `https://api.siliconflow.cn/v1`），不要附加 `/chat/completions`。Gateway 和 Studio 中注册的 Agent 共用 `MODEL_PROXY_BASE_URL`、`MODEL_PROXY_MODEL`、`MODEL_PROXY_API_KEY`。`MODEL_PROXY_MODEL` 可以写 `deepseek-ai/DeepSeek-V4.1-Flash`，也可以写 Studio 显示的 `siliconflow-cn/deepseek-ai/DeepSeek-V4.1-Flash`；调用 OpenAI 兼容接口时会自动去掉 `siliconflow-cn/` 前缀。若在 Studio 的 SiliconFlow CN 模型选择器中调试，还需将 `SILICONFLOW_CN_API_KEY` 设为同一密钥；使用 SiliconFlow CN 地址时，服务启动会校验两者一致。模型代理需要提供 OpenAI 兼容的流式 `tool_calls`，由代理完成 SSO。
-3. 飞书开发者后台启用机器人、**长连接事件订阅**，订阅 `im.message.receive_v1` 和 `im.message.recalled_v1`；在卡片回调中订阅 `card.action.trigger`。撤回事件需要应用具备飞书后台要求的消息读取权限并发布新版本。把机器人加入需要服务的群，并确保应用可访问目标文档、日历与任务。
+3. 飞书开发者后台启用机器人和交互式卡片，在「开发配置 → 事件与回调 → 事件配置」中使用长连接订阅 `im.message.receive_v1`、`im.message.recalled_v1`；**另在「回调配置」页签选择长连接，并在「已订阅的回调」中添加 `card.action.trigger`**。保存后创建并发布新应用版本（企业应用按要求完成审核）。只配置事件订阅或 OAuth「安全设置 → 重定向 URL」不能接收卡片按钮回调。撤回事件需要应用具备飞书后台要求的消息读取权限。把机器人加入需要服务的群，并确保应用可访问目标文档、日历与任务。
 4. 在权限管理中，按照租户当前版本的接口权限清单授予：接收与发送消息、更新消息卡片，创建/读取/编辑新版文档，Wiki 节点读取，电子表格和多维表格读取/写入，读取/创建/更新日历日程，以及读取/创建/更新任务。共享资源默认使用应用身份。个人日历使用用户身份，并要求用户单独授权；私有化环境缺失相应接口时会明确报错，不会借用另一种身份代执行。具体权限以 [飞书开放平台的接口页面](https://open.feishu.cn/document/) 为准。
 5. 将需要私聊机器人的用户 `open_id` 写入 `FEISHU_ALLOWED_USERS`，以逗号分隔；`FEISHU_ALLOWED_CHATS` 用于允许私聊和代发消息的目标会话。首次启动前可先留空：私聊机器人发送 `/id` 获取自己的 `open_id` 与私聊 `chat_id`。将机器人邀请进群后，群内任意成员直接 `@机器人` 即可对话，无须为新成员或新群修改 `.env`、重启网关。群聊普通消息仍须 @机器人。`/id` 只用于查询 ID，不能赋予私聊或跨会话代发权限。`open_id` 与应用绑定，须从这个机器人获取。
 
@@ -19,7 +19,7 @@ npm run gateway
 npm run dev
 ```
 
-也可用 `powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -Mode both`。Mastra Studio 与 API 只绑定 `127.0.0.1:4111`，访问 `http://127.0.0.1:4111/studio`。在 Studio 中查看 Agent、Workflow、Tools 与 Traces；飞书写工具的实地审批需要同时运行网关。生产运行前执行 `npm run build`，再使用 `npm run start` 启动已构建的本机 Studio/API。网关仍以 `npm run gateway` 单独启动。
+也可用 `powershell -ExecutionPolicy Bypass -File .\scripts\start-windows.ps1 -Mode both`。Mastra Studio 与 API 只绑定 `127.0.0.1:4111`，访问 `http://127.0.0.1:4111/studio`。在 Studio 中查看 Agent、Workflow、Tools 与 Traces；飞书写工具的实地审批需要同时运行网关。`dev`、`build`、`start` 脚本会在 Mastra CLI 加载前读取 `.env`；内网环境保持 `MASTRA_TELEMETRY_DISABLED=1`、`MASTRA_OFFLINE=1`、`AUTO_BLOCK_EXTERNAL_PROVIDERS=1`，分别关闭 PostHog 遥测、外部模型目录刷新和 Studio 外部提供商列表。AgentController 仅列出当前配置的内网模型。这些设置不阻止 Agent 访问已配置的模型代理。首次 `npm ci` 和 `npm run build` 的依赖安装仍需可用的内网 npm 镜像或预置缓存。构建完成后使用 `npm run start` 启动本机 Studio/API；网关仍以 `npm run gateway` 单独启动。
 
 更新网关代码后，先在原网关终端按 `Ctrl+C`，确认进程退出，再执行 `npm run gateway`。启动日志会打印新的 PID 和入口文件；`data/gateway.pid` 用于阻止第二个网关实例。如果提示已有网关运行，应先检查该 PID 对应的进程并停止旧实例，不能只启动一个新终端，否则飞书消息可能仍由旧代码处理。
 
@@ -37,6 +37,11 @@ npm run dev
 - `fields` 中允许包含未在模板出现的字段；预览会列出这些未使用字段，它们不会作为参数传给飞书 API，也不会写入副本。若飞书返回 `99992402`，网关错误会列出请求方法、接口、查询参数名及飞书返回的字段违规信息，便于定位实际失败的接口；请在确认卡片出现前处理预检错误。
 - 若下发批次失败或审批被拒绝、过期，原请求者可回复“重新发起”重新执行只读预检并获取新卡片；在群聊中必须发送“@机器人 重新发起”。机器人仅订阅群内 @ 消息时，未 @ 的群消息不会到达网关。新批次不会复用旧审批，执行结果不明的批次仍需人工核对。
 - 用户撤回尚在推理或排队的消息时，网关按消息 ID 取消该轮运行、队列项和关联的待审批操作；已进入飞书写入接口的操作结果仍需人工核对。会话忙时最多暂存 20 条指令并按接收顺序处理，排队超过 30 分钟失效；网关重启后只恢复尚未开始的队列项，不重放执行中的任务。群聊指令仍需 @机器人。
+- 群聊材料预检不调用不支持 `type=folder` 的目录成员接口；审批确认后的 Drive 创建与复制接口仍会独立校验应用写入权限。卡片按钮回调由网关立即返回新版回调协议的 `card: { type: "raw", data: ... }`，再异步执行审批。
+
+**卡片点击报 `200340`：**按[飞书卡片回传交互回调文档](https://open.feishu.cn/document/uAjLw4CM/ukzMukzMukzM/feishu-cards/card-callback-communication)核查应用的「回调配置」页签，而非「事件配置」页签：接收方式须与网关 WebSocket 长连接一致，`card.action.trigger` 须出现在已订阅回调中，且配置变更后的应用版本须已发布生效。确认后台中的 App ID 与 `.env` 的 `FEISHU_APP_ID` 是同一应用；修正后重新发送一张卡片测试。点击时若网关完全没有 `[Feishu card action] callback delivered`，说明回调没有投递到网关，应检查私有化飞书服务端的应用配置、版本与长连接路由；若有该日志，再对照 `[Feishu card action] decision` 和后续 Workflow Trace。`200341` 指回调超时，`200672` 指响应体格式错误，不能把这些错误与 `200340` 混为一谈。机器人能发送卡片、能收私聊或群消息，均不能证明卡片回调订阅已生效。
+
+**订阅后点击仍无结果或出现 `300000`：**旧版网关曾在 `channel.connect()` 之前注册自定义回调，随后被 SDK 默认处理器覆盖，导致点击没有进入审批和 Workflow。更新代码并重启唯一网关进程，重新发起新审批卡片；点击时终端应依次出现 `[Feishu card action] callback delivered`、`Feishu card callback received`、`[Feishu card action] decision`。若只有第一条，检查卡片参数与 `data/state.db` 中该审批的请求者、会话和卡片消息 ID；若出现第二条但没有第三条，查看 `[Feishu card action] failed` 和 Trace。若三条均出现而目录未生成，按 `release_jobs` 的状态与错误定位飞书 Drive 权限或副本处理错误。飞书官方将 `300000` 归为服务内部错误，单凭客户端该码不能断定写入接口失败。
 - 审批记录、消息去重与 Workflow 状态位于 `data/state.db`；Mastra Memory/Controller 状态位于 `data/mastra.db`。重启后，未决的 Office 写入卡片在有效期内仍可确认；挂起的本地/MCP 工具审批与运行中的 Workflow 标记为 `interrupted`，不会重放。外部接口失败后不自动重试，以避免不确定提交造成重复写入。
 
 ### 个人日历授权配置
@@ -61,15 +66,85 @@ npm run dev
 
 > 请用模板文件夹 `https://tenant.example/drive/folder/<模板token>` 生成本次下发材料，放到 `https://tenant.example/drive/folder/<材料父目录token>`，下发编号 `20261029`，下发日期 `2026-10-29`，下发版本负责人 `张三`。
 
-字段名要与模板中的 `{{字段名}}` 一致；“下发编号”自动取文件夹名，若显式提供则必须相同。兼容“版本负责人”和模板中常见的误写“版本负责任”，两者若同时提供必须取相同值。Docx、文件标题或多维表格中缺少需替换字段时预检停止并要求补充；电子表格中未匹配本次字段的占位符保持原值。多提供的字段会列在预览中，不会传给飞书 API，也不会写入副本。仅处理普通云空间文件夹当前层的 Docx、普通电子表格和多维表格；当前层其他类型会报错，子文件夹列入忽略清单。Docx 支持标题、正文和表格单元格中的文本块，单个占位符须位于同一个富文本元素内；电子表格和多维表格的文件标题若含占位符，会在预览中展示改名前后值，确认后仅改副本标题并回读；电子表格普通文本单元格支持整值占位符及 `L_REL_{{下发编号}}` 这样的混合文本，单元格内可替换多个已提供字段，公式不写入；多维表格仅处理普通文本字段的整值占位符。复杂格式会在审批前报错。没有匹配占位符的文件会直接复制，不调用内容写入接口。
+字段名要与模板中的 `{{字段名}}` 一致；“下发编号”自动取文件夹名，若显式提供则必须相同。兼容“版本负责人”和模板中常见的误写“版本负责任”，两者若同时提供必须取相同值。Docx、文件标题或多维表格中缺少需替换字段时预检停止并要求补充；电子表格中未匹配本次字段的占位符保持原值。多提供的字段会列在预览中，不会传给飞书 API，也不会写入副本。仅处理普通云空间文件夹当前层的 Docx、普通电子表格和多维表格；当前层其他类型会报错，子文件夹列入忽略清单。Docx 支持标题、正文和表格单元格中的文本块，单个占位符须位于同一个富文本元素内；电子表格和多维表格的文件标题若含占位符，会在预览中计入替换位置，确认后仅改副本标题并回读；电子表格普通文本单元格支持整值占位符及 `L_REL_{{下发编号}}` 这样的混合文本，单元格内可替换多个已提供字段，公式不写入；多维表格仅处理普通文本字段的整值占位符。复杂格式会在审批前报错。没有匹配占位符的文件会直接复制，不调用内容写入接口。
 
-普通电子表格允许不同工作表只包含部分字段。预检每次最多读取 1,000 个单元格；若某工作表配置的网格超过 100,000 个单元格，需明确提供该表格文件名、工作表名及 `A1:D100` 格式的扫描范围，工具会将其作为 `sheetScopes`，并在审批预览中注明未扫描的工作表。合并单元格中的占位符必须位于合并区域左上角；预览显示整个合并范围，执行前再次核对合并结构，只写入副本的左上角。读取失败会返回工作表、范围、接口和飞书的字段校验详情，便于定位私有化接口差异。
+普通电子表格允许不同工作表只包含部分字段。预检每次最多读取 1,000 个单元格；若某工作表配置的网格超过 100,000 个单元格，需明确提供该表格文件名、工作表名及 `A1:D100` 格式的扫描范围，工具会将其作为 `sheetScopes`，并在审批预览中列出限定扫描范围。合并单元格中的占位符必须位于合并区域左上角；预检会在本地记录整个合并范围，执行前再次核对合并结构，只写入副本的左上角。读取失败会返回工作表、范围、接口和飞书的字段校验详情，便于定位私有化接口差异。
 
 开发者后台需为**应用身份**开通并发布：目录枚举、创建与复制所需的 `drive:drive:readonly` 和 `drive:drive:write`（或租户提供的 `drive:drive`）；新版文档读取和更新所需的 `docx:document:readonly`、`docx:document`；普通电子表格读取与写入所需的 `sheets:spreadsheet:read`、`sheets:spreadsheet:write_only`（或完整读写权限）；多维表格读取与更新所需的 `bitable:app:readonly`、`bitable:app`。私有化租户的权限名称以接口页面及 `99991672` 错误提示为准。管理员须将模板文件夹与材料父目录共享给**包含机器人和请求者的协作群**，并授予机器人源目录读取/复制及目标目录写入权限；材料父目录中的当前协作群须为“可编辑”或“可管理”，仅“可查看”无法创建子文件夹。不能仅把应用直接添加为文件夹协作者。若多维表格使用高级权限，还需授予机器人相应数据表读写权。`FEISHU_DOCUMENT_HOSTS` 必须包含客户端复制链接的域名；公司内网分享域名 `cibt.co.cibfintech.com` 已加入示例与本地配置。API 域名 `FEISHU_DOMAIN` 与文档链接域名可以不同，工具从链接中提取 `folder_token` 后向配置的 API 域名发起请求；请提供完整的 `https://<文档域名>/drive/folder/<token>` 链接。请求者最终能否打开材料文件夹应由该账号在客户端验证。
 
-预检读取完整文件清单及占位符；确认时重新扫描源文件和目标目录。同名材料文件夹会停止，源内容变化会要求重新预览。确认后只修改副本，副本尚未可读时有限等待；每次远端复制/写入最多发起一次。SQLite `release_jobs` 和 `release_files` 记录 Workflow run ID、审批、文件夹、副本 token 和逐文件状态。复制/写入超时或服务重启后，状态标记为需人工核对，保留已有材料，不自动重试、删除或回滚；卡片显示已知文件链接与未完成状态。完整的运行路径需在私有化环境中用测试目录人工确认一次，并从请求者账号验证三类副本内容和可见性。
+预检读取完整文件清单及占位符，并向会话发送一条不含文档正文和富文本参数 JSON 的文件级摘要；完整替换内容留在本地状态库与 Trace 中。确认时重新扫描源文件和目标目录。同名材料文件夹会停止，源内容变化会要求重新预览。卡片回调先校验原请求者、会话和卡片 ID，立即返回有效卡片，再异步执行并更新最终状态，以满足飞书回调时限。确认后只修改副本，副本尚未可读时有限等待；每次远端复制/写入最多发起一次。SQLite `release_jobs` 和 `release_files` 记录 Workflow run ID、审批、文件夹、副本 token 和逐文件状态。确认卡片在执行期间列出每个文件的“待更新、更新中、更新成功或失败”状态并持续刷新，完成或失败后保留最终状态；原始下发请求与执行期间的“确认”跟进不再额外收到“正在执行”文本，明确询问状态仍会得到回复。复制/写入超时或服务重启后，状态标记为需人工核对，保留已有材料，不自动重试、删除或回滚；卡片显示已知文件链接与未完成状态，过长的失败详情只保留在日志、Trace 和状态库中。完整的运行路径需在私有化环境中用测试目录人工确认一次，并从请求者账号验证三类副本内容和可见性。
+
+Docx 副本复制时通过 `POST /open-apis/drive/v1/files/:file_token/copy` 的 `name` 参数设置替换后的标题；若复制服务未同步 Page 块标题，才通过 `PATCH /open-apis/docx/v1/documents/:document_id/blocks/:block_id` 单块更新。正文占位符通过 `PATCH /open-apis/docx/v1/documents/:document_id/blocks/batch_update` 批量更新。私有化部署可能不支持把 Page 块与正文块放入同一批量请求，也可能缺少 Drive 文件改名接口。执行后会回读标题块、正文块及目标文件夹中的文件名；若目录文件名未同步，则标记为需人工核对，不报告整批成功。
 
 ## 调试与验收
+
+### 在内网读取本地 Mastra Trace
+
+本工程通过 `MastraStorageExporter` 将 Agent、Workflow 和 Tool 的 Trace 写入项目根目录的 `data/traces.db`。它使用可由网关和 Studio 两个进程同时访问的 LibSQL；该存储不支持 Mastra Logs，因此已关闭观测日志双写，网关错误仍在终端输出。`data/mastra.db` 存放 Memory/Controller 数据，`data/state.db` 存放网关审批与下发状态。进程启动工作目录不同也会解析到同一个项目 `data` 目录。排查飞书请求时，先记录消息发送时间、会话、下发编号或卡片 ID，再按以下方式查找对应运行。
+
+1. **实时查看：**在运行网关的同一台云桌面启动 `npm run dev`（或构建后 `npm run start`），打开 `http://127.0.0.1:4111/studio` 的 **Traces** 视图；按时间找到运行，展开 Agent → Tool/Workflow span，查看输入、输出、异常及 `traceId`。Studio 仅监听本机；远程排查应通过云桌面访问，不要将该端口直接暴露到内网。确认卡片后的异步执行也可能产生另一条 Trace，需按确认时间继续查找。
+2. **本地命令查看：**在项目目录运行以下 PowerShell 命令，直接查询 `data/traces.db`。SQLite 支持并发读取，无需停止网关和 Studio；使用 `npm ci` 已安装的 `@libsql/client`，无需外网。留空 `MASTRA_TRACE_ID` 列出最近 20 条 Trace，填入列表中的 ID 后重跑可查看该次运行的 span。
+
+   ```powershell
+   $env:MASTRA_TRACE_DB = (Resolve-Path .\data\traces.db).Path
+   $env:MASTRA_TRACE_ID = ''
+   @'
+   import { createClient } from '@libsql/client';
+
+   const db = createClient({ url: `file:${process.env.MASTRA_TRACE_DB}` });
+   const traceId = (process.env.MASTRA_TRACE_ID ?? '').trim();
+   const query = traceId
+     ? { sql: `SELECT startedAt, spanType, name, parentSpanId, errorPreview
+               FROM mastra_ai_spans WHERE traceId = ? ORDER BY startedAt`, args: [traceId] }
+     : { sql: `SELECT traceId, MAX(startedAt) AS last_seen, COUNT(*) AS spans,
+                      MAX(COALESCE(errorPreview, '')) AS error
+               FROM mastra_ai_spans GROUP BY traceId ORDER BY last_seen DESC LIMIT 20`, args: [] };
+   console.table((await db.execute(query)).rows);
+   db.close();
+   '@ | node --input-type=module
+   ```
+
+   表内时间为 UTC，北京时间需加 8 小时。`errorPreview` 可用于定位失败的 Tool/Workflow span。若 API 返回 Trace 列表为空，先确认 `data/traces.db` 存在且网关和 Studio 均使用更新后的代码；也可访问 `http://127.0.0.1:4111/api/observability/traces?page=0&perPage=20` 直接核对 Studio API 返回。飞书卡片回调或外部 API 错误还要对照网关终端日志中的时间、接口、`phase`、飞书 `log_id`，以及 `data/state.db` 中的审批/下发状态；Trace 不能单独证明远端写入成功。
+
+3. **迁移与读取历史 Trace：**旧版本使用项目根目录的 `mastra.duckdb`。停止仍持有该文件的旧网关后，在项目目录执行 `npm run migrate:traces`，将旧 span 导入 `data/traces.db`，刷新 Studio 即可看到历史 Trace。该命令不删除旧文件，重复执行会跳过已导入的 span；旧日志仍保留在 DuckDB。若旧库不在默认位置，可运行 `node .\scripts\migrate-traces.mjs '<旧库路径>' '<项目目录>\data\traces.db'`。需要只读查看旧库或旧日志时，先复制数据库及可能存在的 WAL。复制完成后即可重启服务；后续命令只读取快照。
+
+   ```powershell
+   $snapshot = Join-Path $env:TEMP ("mastra-trace-" + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+   New-Item -ItemType Directory -Path $snapshot | Out-Null
+   Copy-Item .\mastra.duckdb -Destination $snapshot
+   if (Test-Path .\mastra.duckdb.wal) { Copy-Item .\mastra.duckdb.wal -Destination $snapshot }
+   $env:MASTRA_TRACE_DB = Join-Path $snapshot 'mastra.duckdb'
+   $env:MASTRA_TRACE_ID = ''  # 留空列出最近 20 条 Trace；找到目标后改成其 traceId 再运行下一段
+   ```
+
+   如项目根目录没有该文件，用 `Get-ChildItem -Path . -Filter mastra.duckdb -Recurse` 查找实际运行目录，并把 `Copy-Item` 的源路径改为该文件及同目录的 `.wal`。在项目目录运行下面的查询，使用 `npm ci` 已安装的 `@duckdb/node-api`，无需外网或额外数据库工具：
+
+   ```powershell
+   @'
+   import { DuckDBInstance } from '@duckdb/node-api';
+
+   const instance = await DuckDBInstance.create(process.env.MASTRA_TRACE_DB);
+   const connection = await instance.connect();
+   const traceId = (process.env.MASTRA_TRACE_ID ?? '').trim();
+   const filter = traceId ? `WHERE traceId = '${traceId.replaceAll("'", "''")}'` : '';
+   const sql = traceId
+     ? `SELECT CAST(timestamp AS VARCHAR) AS time, eventType, spanId, parentSpanId, name, spanType,
+               LEFT(COALESCE(errorPreview, ''), 500) AS error
+        FROM span_events ${filter} ORDER BY timestamp, spanId`
+     : `SELECT traceId, CAST(MAX(timestamp) AS VARCHAR) AS last_seen,
+               COUNT(DISTINCT spanId) AS spans,
+               LEFT(MAX(COALESCE(errorPreview, '')), 200) AS error
+        FROM span_events GROUP BY traceId ORDER BY MAX(timestamp) DESC LIMIT 20`;
+   console.table((await connection.runAndReadAll(sql)).getRowObjects());
+   if (traceId) {
+     const logs = `SELECT CAST(timestamp AS VARCHAR) AS time, level, message
+                   FROM log_events ${filter} ORDER BY timestamp`;
+     console.table((await connection.runAndReadAll(logs)).getRowObjects());
+   }
+   '@ | node --input-type=module
+   ```
+
+   例如先看最近列表，再设置 `$env:MASTRA_TRACE_ID = '<列表中的 traceId>'` 并重跑查询。旧库的 `span_events` 显示工具调用和错误，`log_events` 显示与该 Trace 关联的日志。原始 `input`/`output` 可能包含消息、文档内容和令牌，上述命令只显示 span 摘要和错误；日志消息与数据库快照也可能包含敏感数据，向外提供前须按公司要求脱敏。
 
 ```powershell
 npm run typecheck

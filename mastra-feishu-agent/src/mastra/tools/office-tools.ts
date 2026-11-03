@@ -1,5 +1,6 @@
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
+import { config } from '../../config';
 import type { Caller } from '../../identity';
 import { officeAction, type OfficeAction } from '../../office/actions';
 import { getOfficeApi } from '../../runtime/office-bridge';
@@ -115,11 +116,27 @@ export const copyDriveFileTool = createTool({
   execute: async ({ fileToken, fileType, name, destinationFolderUrl }, context) => requestOfficeApproval(callerFrom(context), { kind: 'drive_file_copy', fileToken, fileType, name, destinationFolderToken: parseDriveFolderUrl(destinationFolderUrl) }),
 });
 export const renameDriveFileTool = actionTool('drive_file_rename', 'Propose renaming a Docx, Sheets, or Base file in an ordinary Drive folder. Requires requester approval and checks the current title again before writing.');
+const loggedReleaseErrors = new WeakSet<object>();
+function logReleaseError(input: z.infer<typeof releaseInput>, caller: Caller, phase: string, error: unknown) {
+  if (error && typeof error === 'object') {
+    if (loggedReleaseErrors.has(error)) return;
+    loggedReleaseErrors.add(error);
+  }
+  let detail = error instanceof Error ? error.message : String(error);
+  for (const secret of [config.appSecret, config.modelApiKey, config.tokenEncryptionKey, input.templateFolderUrl, input.materialsParentUrl]) {
+    if (secret) detail = detail.replaceAll(secret, '[REDACTED]');
+  }
+  console.error('[prepareReleaseMaterialsTool] failed', JSON.stringify({ phase, releaseId: input.releaseId, chatType: caller.chatType, error: detail.slice(0, 1200) }));
+}
 export const prepareReleaseMaterialsTool = createTool({
   id: 'office_release_materials',
   description: 'Preflight a whole release: scan current-level Docx, Sheets and Base templates, list every placeholder, then send one batch approval card. Require both ordinary Drive folder links, release ID and explicit field values. Sheets may have different field subsets. For a large Sheets grid, ask for optional sheetScopes entries with exact fileName, sheetName and A1:B20 range; only those worksheets and ranges will be scanned. This tool does not write before approval.',
   inputSchema: releaseInput,
-  execute: async (input, context) => requestReleaseMaterials(input, callerFrom(context), context.requestContext.get('messageCreatedAt'), context.requestContext.get('originalMessage')),
+  execute: async (input, context) => {
+    const caller = callerFrom(context);
+    try { return await requestReleaseMaterials(input, caller, context.requestContext.get('messageCreatedAt'), context.requestContext.get('originalMessage')); }
+    catch (error) { logReleaseError(input, caller, 'tool', error); throw error; }
+  },
 });
 
 export async function requestReleaseMaterials(input: z.infer<typeof releaseInput>, caller: Caller, createdAt?: unknown, originalMessage?: unknown) {
@@ -127,23 +144,34 @@ export async function requestReleaseMaterials(input: z.infer<typeof releaseInput
       throw new Error(`当前消息未包含下发编号 ${input.releaseId}；不能沿用历史会话中的批次发起审批`);
     }
     const service = new ReleaseMaterialsService(getOfficeApi());
-    const manifest = await service.prepare(input, caller);
+    let manifest: Awaited<ReturnType<ReleaseMaterialsService['prepare']>>;
+    try { manifest = await service.prepare(input, caller); }
+    catch (error) {
+      logReleaseError(input, caller, 'preflight', error);
+      throw error;
+    }
     if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮下发已取消');
+    const preview = [
+      `下发材料预览：${input.releaseId}`,
+      `将创建 ${manifest.files.length} 个副本；原模板不会修改。`,
+      `替换字段：${Object.keys(input.fields).join('、') || '无'}`,
+      ...(manifest.input.sheetScopes?.length ? [`限定扫描范围：${manifest.input.sheetScopes.map(scope => `${scope.fileName}/${scope.sheetName}!${scope.range}`).join('；')}`] : []),
+      ...manifest.files.map((file, index) => `${index + 1}. ${file.name}（${file.type}）：${file.patches.length ? `${file.patches.length} 处；${[...new Set(file.patches.map(p => p.field))].join('、')}` : '原样复制'}`),
+      ...(manifest.unusedFields?.length ? [`未使用字段：${manifest.unusedFields.join('、')}`] : []),
+      ...(manifest.ignoredFolders.length ? [`忽略子文件夹：${manifest.ignoredFolders.join('、')}`] : []),
+    ].join('\n');
+    if (preview.length > 2800) throw new Error('预览文件清单过长，请减少模板文件数量后重新发起；尚未发送审批卡片');
+    const fieldSummary = Object.entries(input.fields)
+      .map(([key, value]) => `${key}=${value.length > 120 ? `${value.slice(0, 120)}…（完整值见原请求）` : value}`)
+      .join('；');
+    if (fieldSummary.length > 1500) throw new Error('审批字段摘要过长，请减少本批次字段数量；尚未发送审批卡片');
     const job = await service.createJob(caller, manifest, typeof createdAt === 'number' ? createdAt : Date.now());
     if (job.reused) return { status: job.status, approvalId: job.approvalId, jobId: job.jobId };
     const jobId = job.jobId;
-    const previews = [
-      `下发材料预览：${input.releaseId}\n模板文件夹：${input.templateFolderUrl}\n材料父目录：${input.materialsParentUrl}\n将创建 ${manifest.files.length} 个副本；原模板不会修改。${manifest.input.sheetScopes?.length ? `\n限定扫描范围（其他工作表不扫描）：${manifest.input.sheetScopes.map(scope => `${scope.fileName} / ${scope.sheetName}!${scope.range}`).join('；')}` : ''}`,
-      ...manifest.files.map((file, index) => `${index + 1}. ${file.name}（${file.type}）\n${file.patches.map(p => `- ${p.location}: ${p.before} → ${p.after}`).join('\n') || '- 无占位符，原样复制'}`),
-      ...(manifest.unusedFields?.length ? [`已提供但模板未使用的字段：${manifest.unusedFields.join('、')}。这些字段不会传给飞书 API，也不会写入副本。`] : []),
-      ...(manifest.ignoredFolders.length ? [`忽略当前层子文件夹：${manifest.ignoredFolders.join('、')}`] : []),
-    ];
     try {
-      for (const preview of previews) for (let offset = 0; offset < preview.length; offset += 3000) {
-        if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮下发已取消');
-        await sendOfficeText(caller.chatId, preview.slice(offset, offset + 3000));
-      }
-      const proposal = await requestOfficeApproval(caller, { kind: 'release_materials', jobId, releaseId: input.releaseId, fileCount: manifest.files.length, fieldSummary: Object.entries(input.fields).map(([k, v]) => `${k}=${v}`).join('；').slice(0, 1500) });
+      if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮下发已取消');
+      await sendOfficeText(caller.chatId, preview);
+      const proposal = await requestOfficeApproval(caller, { kind: 'release_materials', jobId, releaseId: input.releaseId, fileCount: manifest.files.length, fieldSummary });
       await (await stateDb()).execute({ sql: 'UPDATE release_jobs SET approval_id = ? WHERE id = ?', args: [proposal.approvalId, jobId] });
       return proposal;
     } catch (error) {
