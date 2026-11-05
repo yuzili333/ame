@@ -130,7 +130,7 @@ function logReleaseError(input: z.infer<typeof releaseInput>, caller: Caller, ph
 }
 export const prepareReleaseMaterialsTool = createTool({
   id: 'office_release_materials',
-  description: 'Preflight a whole release: scan current-level Docx, Sheets and Base templates, list every placeholder, then send one batch approval card. Require both ordinary Drive folder links, release ID and explicit field values. Sheets may have different field subsets. For a large Sheets grid, ask for optional sheetScopes entries with exact fileName, sheetName and A1:B20 range; only those worksheets and ranges will be scanned. This tool does not write before approval.',
+  description: 'Preflight a whole release from current-level Docx, Sheets and Base templates, then send one batch approval card. Require both ordinary Drive folder links and a 12-digit release ID. Supply fields as a dynamic map of only the field values explicitly requested in this message; release ID automatically fills {{下发编号}}. Unspecified placeholders remain unchanged, and sheets may have different field subsets. For a large Sheets grid, ask for optional sheetScopes entries with exact fileName, sheetName and A1:B20 range; only those worksheets and ranges will be scanned. This tool does not write before approval.',
   inputSchema: releaseInput,
   execute: async (input, context) => {
     const caller = callerFrom(context);
@@ -151,17 +151,18 @@ export async function requestReleaseMaterials(input: z.infer<typeof releaseInput
       throw error;
     }
     if (await isMessageRecalled(caller.messageId)) throw new Error('原始消息已撤回，本轮下发已取消');
+    const matchedFields = [...new Set(manifest.files.flatMap(file => file.patches.flatMap(patch => patch.fields)))];
     const preview = [
       `下发材料预览：${input.releaseId}`,
       `将创建 ${manifest.files.length} 个副本；原模板不会修改。`,
-      `替换字段：${Object.keys(input.fields).join('、') || '无'}`,
+      `实际替换字段：${matchedFields.join('、') || '无'}`,
       ...(manifest.input.sheetScopes?.length ? [`限定扫描范围：${manifest.input.sheetScopes.map(scope => `${scope.fileName}/${scope.sheetName}!${scope.range}`).join('；')}`] : []),
-      ...manifest.files.map((file, index) => `${index + 1}. ${file.name}（${file.type}）：${file.patches.length ? `${file.patches.length} 处；${[...new Set(file.patches.map(p => p.field))].join('、')}` : '原样复制'}`),
+      ...manifest.files.map((file, index) => `${index + 1}. ${file.name}（${file.type}）：${file.patches.length ? `${file.patches.reduce((total, patch) => total + patch.count, 0)} 处；${[...new Set(file.patches.flatMap(p => p.fields))].join('、')}` : '原样复制'}`),
       ...(manifest.unusedFields?.length ? [`未使用字段：${manifest.unusedFields.join('、')}`] : []),
       ...(manifest.ignoredFolders.length ? [`忽略子文件夹：${manifest.ignoredFolders.join('、')}`] : []),
     ].join('\n');
     if (preview.length > 2800) throw new Error('预览文件清单过长，请减少模板文件数量后重新发起；尚未发送审批卡片');
-    const fieldSummary = Object.entries(input.fields)
+    const fieldSummary = Object.entries(manifest.input.fields)
       .map(([key, value]) => `${key}=${value.length > 120 ? `${value.slice(0, 120)}…（完整值见原请求）` : value}`)
       .join('；');
     if (fieldSummary.length > 1500) throw new Error('审批字段摘要过长，请减少本批次字段数量；尚未发送审批卡片');

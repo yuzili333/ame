@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuiteoapi/node-sdk';
 
-vi.mock('../mastra', () => ({ controller: {} }));
+vi.mock('../mastra', () => ({ controller: {}, mastra: { observability: { getDefaultInstance: () => undefined, flush: async () => undefined } } }));
 
 process.env.AGENT_DATA_DIR = mkdtempSync(join(tmpdir(), 'mastra-feishu-table-test-'));
 process.env.FEISHU_DOCUMENT_HOSTS = 'feishu.cn';

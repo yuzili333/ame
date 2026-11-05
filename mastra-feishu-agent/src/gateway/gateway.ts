@@ -1,10 +1,12 @@
 import { createLarkChannel, normalizeCardAction, type CardActionEvent, type EventDispatcher, type LarkChannel, type NormalizedMessage, type RawCardActionEvent } from '@larksuiteoapi/node-sdk';
 import { RequestContext } from '@mastra/core/request-context';
+import { EntityType, SpanType } from '@mastra/core/observability';
 import type { Server } from 'node:http';
 import { z } from 'zod';
 import { config, requireFeishuConfig } from '../config';
 import { isAuthorizedCaller, isAuthorizedMessage, memoryKeys, type Caller } from '../identity';
-import { controller } from '../mastra';
+import { controller, mastra } from '../mastra';
+import { agent } from '../mastra/agents/agent';
 import { minutesToTasksWorkflow } from '../mastra/workflows/minutes-to-tasks';
 import { releaseMaterialsWorkflow } from '../mastra/workflows/release-materials';
 import { officeTools, requestReleaseMaterials } from '../mastra/tools/office-tools';
@@ -12,15 +14,18 @@ import { OfficeApi, createOfficeTransport } from '../office/client';
 import { ReleaseMaterialsService, releaseInput, type ReleaseManifest } from '../office/release-materials';
 import { actionResultDetail, officeAction } from '../office/actions';
 import { completeCalendarAuthorization, latestPermissionRequestId, resolvePermissionReply, setPermissionNotifier } from '../office/permission-choice';
-import { startOAuthCallback, userAccessToken } from '../office/user-auth';
+import { authorizationUrl, exchangeCodeForUser, startOAuthCallback, userAccessToken } from '../office/user-auth';
 import { completeTableAuthorization, requestTableOperation, resolveTablePermissionReply, setTablePermissionNotifier, supersedeTablePermissionForNewRequest } from '../office/table-permission';
 import { parseFirstEmptySheetCellRequest } from '../office/table-request';
 import { setApprovalNotifier } from '../runtime/approval-bridge';
 import { setOfficeApi, setOfficeTextSender } from '../runtime/office-bridge';
 import { APPROVAL_TTL_MS, decideAction, expireAction, proposeAction } from '../state/approvals';
-import { getAction, isMessageRecalled, markMessageSeen, recoverInterruptedApprovals, recoverInterruptedWorkflows, stateDb } from '../state/store';
+import { expireLegacyReleaseJobs, getAction, isMessageRecalled, markMessageSeen, recoverInterruptedApprovals, recoverInterruptedWorkflows, stateDb } from '../state/store';
 import { approvalCard, cardDecision, releaseProgressCard, resolvedCard, type ReleaseFileProgress } from './cards';
 import { safeSdkLogger } from './safe-sdk-logger';
+import { parseSummaryRequest, type SummaryRequest } from './summary-range';
+import { readHistory, summarizeHistory } from './chat-summary';
+import { backupMention, recoverMentionBackups } from './mention-watch';
 
 type Session = Awaited<ReturnType<typeof controller.createSession>>;
 const minutesCommand = /^\/minutes\s+([\w@.-]+)\s*$/i;
@@ -28,6 +33,13 @@ const idCommand = /^\/id$/i;
 const releaseRetryCommand = /^重新发起(?:下发材料)?[。.!！]?$/;
 const releaseStatusFollowup = /^(?:确认|已确认|批准|已批准|已点击确认|已点击批准|通过(?:新批次|这批|该批|下发材料)?(?:的)?(?:审批|确认)?卡片|(?:查看|核对|检查)(?:新批次|这批|该批|下发材料)?(?:的)?(?:审批|执行)?(?:结果|状态))[。.!！?？]?$/;
 const officeToolNames = new Set(Object.keys(officeTools));
+const SUMMARY_SCOPES = ['im:message:readonly', 'im:message.p2p_msg:get_as_user', 'im:chat:readonly', 'contact:user.base:readonly', 'offline_access'];
+async function summaryScopesFor(userId: string): Promise<string[]> {
+  const row = (await (await stateDb()).execute({ sql: 'SELECT scopes FROM user_tokens WHERE user_id=?', args: [userId] })).rows[0];
+  let previous: string[] = [];
+  try { previous = row?.scopes ? JSON.parse(String(row.scopes)) as string[] : []; } catch { /* Renew with summary scopes. */ }
+  return [...new Set([...previous, ...SUMMARY_SCOPES])];
+}
 
 export class FeishuGateway {
   readonly channel: LarkChannel;
@@ -43,7 +55,7 @@ export class FeishuGateway {
       ...requireFeishuConfig(),
       transport: 'websocket',
       // Receive @bot messages from groups; the gateway checks their identity and mention.
-      policy: { requireMention: true, dmMode: 'open' },
+      policy: { requireMention: false, dmMode: 'open' },
       safety: { chatQueue: { enabled: false }, batch: { text: { delayMs: 0 }, media: { delayMs: 0 } } },
       handshakeTimeoutMs: 15_000,
       logger: safeSdkLogger,
@@ -55,6 +67,7 @@ export class FeishuGateway {
     await stateDb();
     await recoverInterruptedApprovals();
     await recoverInterruptedWorkflows();
+    await expireLegacyReleaseJobs();
     await controller.init();
     setOfficeApi(this.office);
     setOfficeTextSender(async (chatId, content) => { await this.channel.send(chatId, { markdown: content }); });
@@ -67,10 +80,22 @@ export class FeishuGateway {
     setTablePermissionNotifier(async (chatId, text) => { await this.channel.send(chatId, { text }); });
     this.oauthServer = await startOAuthCallback(async (state, code) => {
       const row = (await (await stateDb()).execute({ sql: 'SELECT status FROM permission_requests WHERE id = ?', args: [state] })).rows[0];
-      if (row?.status === 'table_auth') await completeTableAuthorization(state, code);
+      if (row?.status === 'summary_auth') {
+        const request = (await (await stateDb()).execute({ sql: 'SELECT requester_id, expires_at FROM permission_requests WHERE id = ?', args: [state] })).rows[0];
+        if (!request || Number(request.expires_at) < Date.now()) throw new Error('总结授权请求不存在或已过期');
+        await exchangeCodeForUser(code, String(request.requester_id), await summaryScopesFor(String(request.requester_id)));
+        await (await stateDb()).execute({ sql: "UPDATE permission_requests SET status='summary_authorized' WHERE id=?", args: [state] });
+        await this.sendPrivate(String(request.requester_id), '授权完成。请重新发送私聊总结请求，并附上目标会话 ID。');
+      } else if (row?.status === 'table_auth') await completeTableAuthorization(state, code);
       else await completeCalendarAuthorization(state, code);
     });
-    this.channel.on('message', message => { void this.enqueue(message).catch(error => this.report(error)); });
+    this.channel.on('message', message => {
+      if (message.chatType === 'group' && config.mentionOwnerOpenId) {
+        void backupMention(message, config.mentionOwnerOpenId, this.office, this.channel).catch(error => this.report(error));
+      }
+      if (message.chatType === 'group' && !message.mentionedBot) return;
+      void this.enqueue(message).catch(error => this.report(error));
+    });
     // LarkChannel does not expose recalled messages in EventMap, but its SDK
     // EventDispatcher accepts the same event on the existing WebSocket.
     const dispatcher = (this.channel as unknown as { dispatcher?: EventDispatcher }).dispatcher;
@@ -80,6 +105,7 @@ export class FeishuGateway {
     } });
     this.channel.on('error', error => this.report(error));
     await this.channel.connect();
+    void recoverMentionBackups(this.office, this.channel).catch(error => this.report(error));
     // connect() installs the SDK's default card handler. Replace it afterwards:
     // it discards return values and no Channel cardAction listener is attached.
     dispatcher.unregister('card.action.trigger');
@@ -103,6 +129,60 @@ export class FeishuGateway {
 
   private report(error: unknown) {
     console.error(error instanceof Error ? error.message : String(error));
+  }
+
+  private async sendPrivate(openId: string, text: string): Promise<void> {
+    const result = await this.channel.rawClient.request({ method: 'POST', url: '/open-apis/im/v1/messages', params: { receive_id_type: 'open_id' },
+      data: { receive_id: openId, msg_type: 'text', content: JSON.stringify({ text }) } });
+    if (result.code !== 0) throw new Error(`私聊发送失败：${result.code} ${result.msg}`);
+  }
+
+  private async handleSummary(request: SummaryRequest, caller: Caller): Promise<string | undefined> {
+    if (request.kind === 'group') {
+      const history = await readHistory(this.office, caller.chatId, request.range);
+      const result = await summarizeHistory(history.messages.filter(item => item.message_id !== caller.messageId), request.range, history.truncated);
+      await this.channel.send(caller.chatId, { markdown: result }, { replyTo: caller.messageId });
+      return result;
+    }
+    const notify = async (text: string) => {
+      await this.sendPrivate(caller.userId, text);
+      if (caller.chatType === 'group') await this.channel.send(caller.chatId, { text: '私聊总结的后续信息已发送给请求者，请到机器人私聊查看。' }, { replyTo: caller.messageId });
+    };
+    const token = await userAccessToken(caller.userId, SUMMARY_SCOPES);
+    if (!token) {
+      const state = crypto.randomUUID();
+      const db = await stateDb();
+      await db.execute({ sql: "INSERT INTO permission_requests(id,requester_id,chat_id,chat_type,payload,status,created_at,expires_at,origin_message_id) VALUES (?,?,?,?,?,'summary_auth',?,?,?)",
+        args: [state, caller.userId, caller.chatId, caller.chatType, JSON.stringify(request), Date.now(), Date.now() + 30 * 60_000, caller.messageId ?? null] });
+      await notify(`读取你与 ${request.peerName} 的私聊需要你的飞书用户授权。请打开：${authorizationUrl(state, await summaryScopesFor(caller.userId))}\n授权后重新发送请求。`);
+      return;
+    }
+    let targetChatId = request.chatId;
+    if (!targetChatId) {
+      try {
+        const found = await this.office.call({ method: 'GET', url: '/open-apis/im/v1/chats/search', userAccessToken: token,
+          params: { query: request.peerName, page_size: 50 } });
+        const candidates = ((found.items ?? []) as Array<{ chat_id?: string; chat_mode?: string; name?: string; p2p_target_type?: string }>)
+          .filter(item => item.chat_mode === 'p2p' && item.p2p_target_type !== 'bot' && item.name === request.peerName && item.chat_id);
+        if (candidates.length === 1) targetChatId = candidates[0].chat_id;
+        if (candidates.length > 1) { await notify(`找到多个名为 ${request.peerName} 的单聊，请补充目标会话 ID（oc_...）后重新发送完整请求。`); return; }
+      } catch (error) { this.report(error); }
+    }
+    if (!targetChatId) { await notify(`请补充你与 ${request.peerName} 的私聊会话 ID（oc_...），并重新发送完整请求。飞书会话列表接口通常不返回单聊。`); return; }
+    const data = await this.office.call({ method: 'GET', url: `/open-apis/im/v1/chats/${encodeURIComponent(targetChatId)}`, userAccessToken: token });
+    const chat = (data.chat ?? data) as { chat_mode?: string; name?: string; p2p_target_type?: string; p2p_target_id?: string };
+    if (chat.chat_mode !== 'p2p') throw new Error('会话 ID 不是用户私聊，未读取消息。');
+    if (chat.p2p_target_type === 'bot') throw new Error('该会话是机器人私聊，未读取消息。');
+    let peerName = chat.name;
+    if (chat.p2p_target_id) {
+      const personData = await this.office.call({ method: 'GET', url: `/open-apis/contact/v3/users/${encodeURIComponent(chat.p2p_target_id)}`, userAccessToken: token, params: { user_id_type: 'open_id' } });
+      peerName = (personData.user as { name?: string } | undefined)?.name;
+    }
+    if (!peerName || peerName !== request.peerName) throw new Error(`会话对方与指定姓名“${request.peerName}”不一致，未读取消息。`);
+    const history = await readHistory(this.office, targetChatId, request.range, token);
+    const result = await summarizeHistory(history.messages, request.range, history.truncated);
+    await notify(result);
+    return result;
   }
 
   async ackCardAction(raw: RawCardActionEvent) {
@@ -239,7 +319,47 @@ export class FeishuGateway {
       if (!fromQueue) await this.queueMessage(message);
       return;
     }
+    const span = (() => {
+      try {
+        return mastra.observability.getDefaultInstance()?.startSpan({
+          type: SpanType.GENERIC,
+          name: 'Feishu gateway chat message',
+          entityType: EntityType.AGENT,
+          entityId: agent.id,
+          entityName: agent.name,
+          input: { content, messageId: message.messageId, chatType: message.chatType },
+          metadata: { chatId: caller.chatId, userId: caller.userId, source: 'feishu-gateway' },
+        });
+      } catch (error) {
+        this.report(new Error(`飞书消息 Trace 创建失败：${error instanceof Error ? error.message : String(error)}`));
+        return undefined;
+      }
+    })();
+    let traceReply: string | undefined;
+    let traceError: Error | undefined;
     try {
+      let summary: SummaryRequest | null = null;
+      try { summary = parseSummaryRequest(content, message.createTime || Date.now(), message.chatType); }
+      catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        traceError = error instanceof Error ? error : new Error(detail);
+        traceReply = detail;
+        if (message.chatType === 'group' && /私聊|单聊/.test(content)) await this.sendPrivate(caller.userId, detail);
+        else await this.channel.send(caller.chatId, { text: detail }, { replyTo: message.messageId });
+        return;
+      }
+      if (summary) {
+        try { traceReply = await this.handleSummary(summary, caller); }
+        catch (error) {
+          this.report(error);
+          const detail = `无法完成聊天总结：${error instanceof Error ? error.message : String(error)}`;
+          traceError = error instanceof Error ? error : new Error(String(error));
+          traceReply = detail;
+          if (summary.kind === 'private') await this.sendPrivate(caller.userId, detail);
+          else await this.channel.send(caller.chatId, { text: detail }, { replyTo: message.messageId });
+        }
+        return;
+      }
       if (lookupId) {
         const text = message.chatType === 'p2p'
           ? message.senderId.startsWith('ou_')
@@ -281,8 +401,16 @@ export class FeishuGateway {
         await this.runAgent(content, caller, message.messageId, message.createTime, freshTableRetry);
       }
     } catch (error) {
+      traceError = error instanceof Error ? error : new Error(String(error));
       this.report(error);
       if (!(await isMessageRecalled(message.messageId))) await this.channel.send(message.chatId, { text: '处理失败。请检查模型代理、飞书权限和服务日志。' }, { replyTo: message.messageId });
+    } finally {
+      try {
+        if (traceError) span?.error({ error: traceError, endSpan: true });
+        else span?.end({ output: { reply: traceReply ?? null } });
+        await mastra.observability.flush();
+      }
+      catch (error) { this.report(new Error(`飞书消息 Trace 写入失败：${error instanceof Error ? error.message : String(error)}`)); }
     }
   }
 
@@ -362,8 +490,10 @@ export class FeishuGateway {
   }
 
   private async handleKnownReleaseRequest(content: string, caller: Caller, replyTo: string, createdAt: number): Promise<boolean> {
+    if (/(?:字段\s*)?(?:更新|修改|改为|设为)|(?:字段\s*)?变更/.test(content)) return false;
     const latest = await this.latestReleaseJob(caller);
     if (!latest) return false;
+    if (latest.manifest.rulesVersion !== 2) return false;
     const input = latest.manifest.input;
     const values = [...new Set(Object.values(input.fields))].filter(Boolean);
     if (!content.includes(input.releaseId) || !content.includes(input.templateFolderUrl)
@@ -408,8 +538,9 @@ export class FeishuGateway {
 
   private async retryRelease(caller: Caller, latest: { status: string; manifest: ReleaseManifest; approvalId?: string }, replyTo: string, createdAt: number): Promise<void> {
     if (['failed', 'denied', 'expired'].includes(latest.status)) {
-      const input = releaseInput.parse(latest.manifest.input);
       try {
+        if (latest.manifest.rulesVersion !== 2) throw new Error('旧版下发审批已失效，请提供 12 位下发编号、两个文件夹链接和本次字段值重新发起');
+        const input = releaseInput.parse(latest.manifest.input);
         const result = await requestReleaseMaterials(input, caller, createdAt);
         if (result.status !== 'pending') await this.channel.send(caller.chatId, { text: `下发材料重试状态：${result.status}。` }, { replyTo });
       } catch (error) {

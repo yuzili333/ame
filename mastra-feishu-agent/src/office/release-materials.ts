@@ -10,19 +10,23 @@ const fieldName = z.string().trim().min(1).max(100);
 export const releaseInput = z.object({
   templateFolderUrl: z.string().url(),
   materialsParentUrl: z.string().url(),
-  releaseId: z.string().trim().min(1).max(100).regex(/^[^\\/<>:"|?*\x00-\x1f]+$/),
+  releaseId: z.string().trim().regex(/^\d{12}$/, '下发编号必须为 12 位数字'),
   fields: z.record(fieldName, z.string().max(20_000).refine(v => !v.includes('{{') && !v.includes('}}'), '字段值不能包含占位符标记')),
   sheetScopes: z.array(z.object({ fileName: z.string().min(1), sheetName: z.string().min(1), range: z.string().regex(/^[A-Z]+[1-9]\d*:[A-Z]+[1-9]\d*$/) })).max(100).optional(),
 });
 export type ReleaseInput = z.infer<typeof releaseInput>;
 export type ReleaseType = 'docx' | 'sheet' | 'bitable';
 export type DriveFile = { token: string; name: string; type: ReleaseType | 'folder' | string; url?: string; modified_time?: string };
-type Patch = { location: string; field: string; before: string; after: string; blockId?: string; elements?: unknown[]; title?: boolean; fileName?: boolean; sheetId?: string; cell?: string; mergeRange?: string; tableId?: string; recordId?: string; fieldName?: string };
+type Patch = { location: string; field: string; fields: string[]; count: number; before: string; after: string; blockId?: string; elements?: unknown[]; title?: boolean; fileName?: boolean; sheetId?: string; cell?: string; mergeRange?: string; tableId?: string; recordId?: string; fieldName?: string };
 type ScannedFile = DriveFile & { patches: Patch[]; fingerprint: string; pageTitle?: string };
 type ScanResult = { patches: Patch[]; fingerprint: string; pageTitle?: string };
-export type ReleaseManifest = { input: ReleaseInput; templateFolderToken: string; materialsParentToken: string; files: ScannedFile[]; ignoredFolders: string[]; unusedFields?: string[] };
+export type ReleaseManifest = { rulesVersion: 2; input: ReleaseInput; templateFolderToken: string; materialsParentToken: string; files: ScannedFile[]; ignoredFolders: string[]; unusedFields?: string[] };
 const marker = /\{\{([^{}]+)\}\}/g;
 const enc = encodeURIComponent;
+
+function matchedFields(text: string, fields: Record<string, string>): string[] {
+  return [...text.matchAll(marker)].map(([, raw]) => raw.trim()).filter(name => Object.hasOwn(fields, name));
+}
 
 export function parseDriveFolderUrl(value: string): string {
   const url = new URL(value);
@@ -33,13 +37,10 @@ export function parseDriveFolderUrl(value: string): string {
   return token.parse(match[1]);
 }
 
-function replacement(before: string, fields: Record<string, string>, used: Set<string>, preserveUnknown = false): string {
+function replacement(before: string, fields: Record<string, string>, used: Set<string>): string {
   return before.replace(marker, (whole, raw: string) => {
     const name = raw.trim();
-    if (!Object.hasOwn(fields, name)) {
-      if (preserveUnknown) return whole;
-      throw new Error(`模板需要字段“${name}”，请补充后重新发起`);
-    }
+    if (!Object.hasOwn(fields, name)) return whole;
     used.add(name);
     return fields[name];
   });
@@ -140,29 +141,36 @@ export class ReleaseMaterialsService {
             pageTitle = elements.map(element => element.text_run!.content).join('');
           }
         }
-        if (!containsMarker(block)) continue;
+        const joinedMatches = Object.values(block).flatMap(value => {
+          if (!value || typeof value !== 'object' || !Array.isArray((value as { elements?: unknown }).elements)) return [];
+          const content = value as { elements: Array<{ text_run?: { content?: string } }> };
+          return matchedFields(content.elements.map(element => element.text_run?.content ?? '').join(''), fields);
+        });
+        if (!matchedFields(JSON.stringify(block), fields).length && !joinedMatches.length) continue;
         const candidates = Object.entries(block).filter(([, v]) => v && typeof v === 'object' && Array.isArray((v as { elements?: unknown }).elements)) as Array<[string, { elements: Array<Record<string, unknown>> }]>;
         if (candidates.length !== 1 || typeof block.block_id !== 'string') throw new Error(`${file.name} ${location} 的占位符位于不支持的块格式`);
         const [contentKey, content] = candidates[0];
         const elements = structuredClone(content.elements);
+        const names = content.elements.flatMap(element => matchedFields((element.text_run as { content?: string } | undefined)?.content ?? '', fields));
+        const combinedBefore = content.elements.map(element => (element.text_run as { content?: string } | undefined)?.content ?? '').join('');
+        if (matchedFields(combinedBefore, fields).length !== names.length) throw new Error(`${file.name} ${location} 的占位符跨越富文本元素`);
         let changed = false;
         for (const element of elements) {
           const run = element.text_run as { content?: string } | undefined;
           if (typeof run?.content !== 'string') {
-            if (containsMarker(element)) throw new Error(`${file.name} ${location} 的占位符跨越富文本元素或位于非文本元素`);
+            if (matchedFields(JSON.stringify(element), fields).length) throw new Error(`${file.name} ${location} 的占位符位于非文本元素`);
             continue;
           }
           const next = replacement(run.content, fields, used);
           changed ||= next !== run.content;
           run.content = next;
         }
-        const combined = elements.map(element => (element.text_run as { content?: string } | undefined)?.content ?? '').join('');
-        if (!changed || combined.includes('{{') || containsMarker({ ...block, [contentKey]: { ...content, elements } })) throw new Error(`${file.name} ${location} 的占位符跨越富文本元素或位于不支持的属性`);
+        if (!changed || matchedFields(JSON.stringify({ ...block, [contentKey]: { ...content, elements } }), fields).length) throw new Error(`${file.name} ${location} 的占位符位于不支持的属性`);
         const title = block.block_type === 1;
         if (title && (contentKey !== 'page' || elements.some(element => typeof (element.text_run as { content?: unknown } | undefined)?.content !== 'string'))) {
           throw new Error(`${file.name} 的标题包含不支持的富文本格式，无法安全替换`);
         }
-        patches.push({ location, field: title ? '标题' : '富文本', before: JSON.stringify(content.elements), after: JSON.stringify(elements), blockId: block.block_id, elements, ...(title ? { title: true } : {}) });
+        patches.push({ location, field: [...new Set(names)].join('、'), fields: [...new Set(names)], count: names.length, before: JSON.stringify(content.elements), after: JSON.stringify(elements), blockId: block.block_id, elements, ...(title ? { title: true } : {}) });
       }
       pageToken = data.has_more === true ? String(data.page_token ?? '') : undefined;
       if (data.has_more === true && !pageToken) throw new Error('Docx 分页缺少下一页标识');
@@ -219,17 +227,15 @@ export class ReleaseMaterialsService {
         for (let r = 0; r < matrix.length; r++) for (let c = 0; c < matrix[r].length; c++) {
           const cell = matrix[r][c];
           if (!containsMarker(cell)) continue;
-          const matchedField = [...(JSON.stringify(cell) ?? '').matchAll(marker)]
-            .some(([, raw]) => Object.hasOwn(fields, raw.trim()));
-          if (!matchedField) continue;
+          if (!matchedFields(JSON.stringify(cell), fields).length) continue;
           const actualCol = firstCol + c;
           if (typeof cell !== 'string' || cell.trimStart().startsWith('=')) throw new Error(`${file.name} ${sheet.title ?? sheet.sheet_id}!${column(actualCol)}${start + r} 含公式或非普通文本占位符`);
           const cellRef = `${column(actualCol)}${start + r}`;
           const merge = mergeAt(sheet, start + r - 1, actualCol);
           if (merge && merge.anchor !== cellRef) throw new Error(`${file.name} ${sheet.title ?? sheet.sheet_id}!${cellRef} 位于合并区域 ${merge.range} 的非左上角，无法安全替换`);
-          const after = replacement(cell, fields, used, true);
-          const matchedNames = [...new Set([...cell.matchAll(marker)].map(([, raw]) => raw.trim()).filter(name => Object.hasOwn(fields, name)))];
-          patches.push({ location: `${sheet.title ?? sheet.sheet_id}!${merge?.range ?? cellRef}`, field: matchedNames.join('、'), before: cell, after, sheetId: sheet.sheet_id, cell: cellRef, ...(merge ? { mergeRange: merge.range } : {}) });
+          const names = matchedFields(cell, fields);
+          const after = replacement(cell, fields, used);
+          patches.push({ location: `${sheet.title ?? sheet.sheet_id}!${merge?.range ?? cellRef}`, field: [...new Set(names)].join('、'), fields: [...new Set(names)], count: names.length, before: cell, after, sheetId: sheet.sheet_id, cell: cellRef, ...(merge ? { mergeRange: merge.range } : {}) });
         }
       }
     }
@@ -262,12 +268,13 @@ export class ReleaseMaterialsService {
           for (const record of (records.items as Array<{ record_id?: string; fields?: Record<string, unknown> }> | undefined) ?? []) {
             if (!record.record_id) throw new Error(`${file.name} 有记录缺少 record_id`);
             for (const [name, value] of Object.entries(record.fields ?? {})) {
-              if (!containsMarker(value)) continue;
+              if (!matchedFields(JSON.stringify(value), fields).length) continue;
               if (types.get(name) !== 1) throw new Error(`${file.name} / ${table.name ?? table.table_id} / ${name} 的占位符不在普通文本字段`);
               if (Array.isArray(value) && value.some(v => typeof v?.text !== 'string')) throw new Error(`${file.name} / ${name} 包含复杂文本元素，无法安全替换`);
               const text = typeof value === 'string' ? value : Array.isArray(value) ? value.map(v => v.text as string).join('') : '';
               if (!/^\{\{[^{}]+\}\}$/.test(text)) throw new Error(`${file.name} / ${table.name ?? table.table_id} / ${name} 不是整值占位符`);
-              patches.push({ location: `${table.name ?? table.table_id} / ${record.record_id} / ${name}`, field: text.slice(2, -2).trim(), before: text, after: replacement(text, fields, used), tableId: table.table_id, recordId: record.record_id, fieldName: name });
+              const matched = matchedFields(text, fields);
+              patches.push({ location: `${table.name ?? table.table_id} / ${record.record_id} / ${name}`, field: matched[0], fields: matched, count: matched.length, before: text, after: replacement(text, fields, used), tableId: table.table_id, recordId: record.record_id, fieldName: name });
             }
           }
           recordPage = records.has_more ? String(records.page_token ?? '') : undefined;
@@ -290,10 +297,11 @@ export class ReleaseMaterialsService {
     } catch (error) {
       throw new Error(`扫描模板“${file.name}”（${file.type}）失败：${String(error)}`, { cause: error });
     }
-    if ((file.type === 'sheet' || file.type === 'bitable') && file.name.includes('{{')) {
+    if ((file.type === 'sheet' || file.type === 'bitable') && matchedFields(file.name, fields).length) {
+      const names = matchedFields(file.name, fields);
       const after = replacement(file.name, fields, used);
-      if (after === file.name || after.includes('{{') || after.length > 255) throw new Error(`${file.name} 的文件标题占位符无法安全替换`);
-      scan.patches.unshift({ location: '文件标题', field: '标题', before: file.name, after, fileName: true });
+      if (after === file.name || after.length > 255) throw new Error(`${file.name} 的文件标题占位符无法安全替换`);
+      scan.patches.unshift({ location: '文件标题', field: [...new Set(names)].join('、'), fields: [...new Set(names)], count: names.length, before: file.name, after, fileName: true });
     }
     const { pageTitle, ...stableScan } = scan;
     return { ...file, ...stableScan, ...(includePageTitle ? { pageTitle } : {}) };
@@ -302,12 +310,6 @@ export class ReleaseMaterialsService {
   async prepare(input: ReleaseInput, caller?: Caller): Promise<ReleaseManifest> {
     const parsed = releaseInput.parse(input);
     if (parsed.fields['下发编号'] !== undefined && parsed.fields['下发编号'] !== parsed.releaseId) throw new Error('“下发编号”字段值必须与文件夹下发编号一致');
-    const owner = parsed.fields['版本负责人'];
-    const ownerTypo = parsed.fields['版本负责任'];
-    if (owner !== undefined && ownerTypo !== undefined && owner !== ownerTypo) throw new Error('“版本负责人”和“版本负责任”的值不一致，请明确提供同一个负责人');
-    if (owner !== undefined || ownerTypo !== undefined) {
-      parsed.fields = { ...parsed.fields, 版本负责人: owner ?? ownerTypo!, 版本负责任: owner ?? ownerTypo! };
-    }
     parsed.fields = { 下发编号: parsed.releaseId, ...parsed.fields };
     const templateFolderToken = parseDriveFolderUrl(parsed.templateFolderUrl);
     const materialsParentToken = parseDriveFolderUrl(parsed.materialsParentUrl);
@@ -323,10 +325,8 @@ export class ReleaseMaterialsService {
     const used = new Set<string>();
     const scanned: ScannedFile[] = [];
     for (const file of files) scanned.push(await this.scanFile(file, parsed.fields, used, parsed.sheetScopes));
-    const unusedFields = Object.keys(parsed.fields).filter(name => name !== '下发编号' && !used.has(name)
-      && !(name === '版本负责人' && used.has('版本负责任'))
-      && !(name === '版本负责任' && used.has('版本负责人')));
-    return { input: parsed, templateFolderToken, materialsParentToken, files: scanned, ignoredFolders, unusedFields };
+    const unusedFields = Object.keys(parsed.fields).filter(name => name !== '下发编号' && !used.has(name));
+    return { rulesVersion: 2, input: parsed, templateFolderToken, materialsParentToken, files: scanned, ignoredFolders, unusedFields };
   }
 
   async createJob(caller: Caller, manifest: ReleaseManifest, messageCreatedAt = Date.now()): Promise<{ jobId: string; reused: boolean; status: string; approvalId?: string }> {
@@ -354,6 +354,7 @@ export class ReleaseMaterialsService {
     const approval = row.approval_id ? (await db.execute({ sql: 'SELECT status, requester_id, chat_id FROM actions WHERE id = ? AND kind = ?', args: [row.approval_id, 'release_materials'] })).rows[0] : undefined;
     if (!approval || approval.status !== 'executing' || approval.requester_id !== row.requester_id || approval.chat_id !== row.chat_id) throw new Error('整批任务缺少原请求者已确认的有效审批');
     const manifest = JSON.parse(String(row.manifest_json)) as ReleaseManifest;
+    if (manifest.rulesVersion !== 2) throw new Error('旧版下发审批已失效，请重新发起');
     const claimed = await db.execute({ sql: "UPDATE release_jobs SET status = 'running', updated_at = ? WHERE id = ? AND status = 'pending'", args: [Date.now(), jobId] });
     if (!claimed.rowsAffected) throw new Error('整批任务已被其他执行者领取');
     try {

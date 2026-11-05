@@ -71,6 +71,10 @@ async function initializeStateDb(): Promise<Client> {
     status TEXT NOT NULL, created_at INTEGER NOT NULL
   )`);
   await db.execute('CREATE INDEX IF NOT EXISTS queued_messages_chat ON queued_messages(chat_id, status, created_at)');
+  await db.execute(`CREATE TABLE IF NOT EXISTS mention_backups (
+    message_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, owner_id TEXT NOT NULL,
+    status TEXT NOT NULL, created_at INTEGER NOT NULL
+  )`);
   await db.execute(`CREATE TABLE IF NOT EXISTS workflow_jobs (
     id TEXT PRIMARY KEY,
     run_id TEXT,
@@ -152,6 +156,25 @@ export async function recoverInterruptedWorkflows(): Promise<number> {
   });
   await db.execute({ sql: "UPDATE release_jobs SET status = 'needs_review', error = '服务重启：上次执行结果可能不明，请人工核对，不会自动重试', updated_at = ? WHERE status IN ('running', 'creating_folder')", args: [Date.now()] });
   return result.rowsAffected;
+}
+
+export async function expireLegacyReleaseJobs(): Promise<number> {
+  const db = await stateDb();
+  const pending = await db.execute("SELECT id, manifest_json, approval_id FROM release_jobs WHERE status = 'pending'");
+  let expired = 0;
+  for (const row of pending.rows) {
+    const manifest = JSON.parse(String(row.manifest_json)) as { rulesVersion?: number };
+    if (manifest.rulesVersion === 2) continue;
+    if (typeof row.approval_id === 'string') {
+      await db.execute({ sql: "UPDATE actions SET status = 'expired' WHERE id = ? AND kind = 'release_materials' AND status = 'pending'", args: [row.approval_id] });
+    }
+    const result = await db.execute({
+      sql: "UPDATE release_jobs SET status = 'expired', error = '旧版下发审批已失效，请重新发起', updated_at = ? WHERE id = ? AND status = 'pending'",
+      args: [Date.now(), row.id],
+    });
+    expired += result.rowsAffected;
+  }
+  return expired;
 }
 
 export async function getAction(id: string): Promise<StoredAction | null> {

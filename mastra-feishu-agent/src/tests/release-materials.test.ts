@@ -21,7 +21,7 @@ afterAll(() => { vi.unstubAllEnvs(); rmSync(dataDir, { recursive: true, force: t
 const input = {
   templateFolderUrl: 'https://feishu.cn/drive/folder/template',
   materialsParentUrl: 'https://feishu.cn/drive/folder/parent',
-  releaseId: '20261029',
+  releaseId: '202610290001',
   fields: { 负责人: '张三', 日期: '2026-10-29' },
 };
 const caller = { userId: 'u-release', chatId: 'g-release', chatType: 'group' as const };
@@ -36,13 +36,13 @@ async function approvedJob(service: InstanceType<typeof ReleaseMaterialsService>
   return jobId;
 }
 
-function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; duplicateFolder?: boolean; failCopy?: boolean; failWrite?: boolean; copyReadDelay?: boolean; formulaMarker?: boolean; ownerTypo?: boolean; docTitleMarker?: boolean; sheetTitleMarker?: boolean; sheetMixedText?: boolean; mergedSheet?: boolean; copyMergeChangesAfterScan?: boolean; plainTemplates?: boolean; failFolderForbidden?: boolean; privateNoDriveRename?: boolean; privateBatchRejectsPage?: boolean; privateRejectsPagePatch?: boolean; docTitleUpdateDoesNotRenameFile?: boolean; rejectSingleBlockGet?: boolean } = {}) {
+function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; duplicateFolder?: boolean; failCopy?: boolean; failWrite?: boolean; copyReadDelay?: boolean; formulaMarker?: boolean; ownerTypo?: boolean; dynamicFields?: boolean; docTitleMarker?: boolean; sheetTitleMarker?: boolean; sheetMixedText?: boolean; mergedSheet?: boolean; copyMergeChangesAfterScan?: boolean; plainTemplates?: boolean; failFolderForbidden?: boolean; privateNoDriveRename?: boolean; privateBatchRejectsPage?: boolean; privateRejectsPagePatch?: boolean; docTitleUpdateDoesNotRenameFile?: boolean; rejectSingleBlockGet?: boolean } = {}) {
   const calls: import('../office/client').ApiRequest[] = [];
   let created = false;
   let sourceReads = 0;
-  const originalDocText = options.plainTemplates ? '普通说明' : options.ownerTypo ? '{{下发编号}} / {{版本负责任}}' : '{{下发编号}} / {{负责人}}';
-  const originalSheetText = options.plainTemplates ? '普通表格' : options.sheetMixedText ? 'L_REL_{{下发编号}}' : '{{日期}}';
-  const originalBaseText = options.plainTemplates ? '普通记录' : '{{负责人}}';
+  const originalDocText = options.plainTemplates ? '普通说明' : options.dynamicFields ? '{{下发编号}} / {{代理地址}} / {{未指定}}' : options.ownerTypo ? '{{下发编号}} / {{版本负责任}}' : '{{下发编号}} / {{负责人}}';
+  const originalSheetText = options.plainTemplates ? '普通表格' : options.dynamicFields ? 'Tag={{版本Tag}} / {{未指定}}' : options.sheetMixedText ? 'L_REL_{{下发编号}}' : '{{日期}}';
+  const originalBaseText = options.plainTemplates ? '普通记录' : options.dynamicFields ? '{{代理地址}}' : '{{负责人}}';
   let docText = originalDocText;
   let copyTitle = options.docTitleMarker ? '说明{{下发编号}}' : '说明.docx';
   let pageTitle = copyTitle;
@@ -65,7 +65,7 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
       if (url === '/open-apis/drive/v1/files' && request.method === 'GET') {
         const folder = request.params?.folder_token;
         if (folder === 'template') data = request.params?.page_token ? { files: [{ token: options.unsupported ? 'pdf1' : 'baseSource', name: '责任表', type: options.unsupported ? 'file' : 'bitable', modified_time: '1' }], has_more: false } : { files: sourceItems, has_more: true, next_page_token: 'next' };
-        else if (folder === 'parent') data = { files: options.duplicateFolder ? [{ token: 'existing', name: '20261029', type: 'folder' }] : created ? [{ token: 'newFolder', name: '20261029', type: 'folder' }] : [], has_more: false };
+        else if (folder === 'parent') data = { files: options.duplicateFolder ? [{ token: 'existing', name: '202610290001', type: 'folder' }] : created ? [{ token: 'newFolder', name: '202610290001', type: 'folder' }] : [], has_more: false };
         else if (folder === 'newFolder') data = { files: [
           ...(copied.has('doxcnCopy') ? [{ token: 'doxcnCopy', name: copyTitle, type: 'docx' }] : []),
           ...(copied.has('shtCopy') ? [{ token: 'shtCopy', name: copySheetName, type: 'sheet' }] : []),
@@ -93,7 +93,7 @@ function fixture(options: { unsupported?: boolean; sourceChanged?: boolean; dupl
         const isCopy = url.includes('doxcnCopy');
         if (isCopy && options.copyReadDelay && !copyReadFailed) { copyReadFailed = true; throw new Error('not ready'); }
         if (!isCopy && options.sourceChanged && ++sourceReads > 1) docText = '{{下发编号}} / {{负责人}} / 变更';
-        const items: Array<Record<string, unknown>> = [{ block_id: isCopy ? 'blockCopy' : 'blockSource', block_type: 2, text: { elements: [{ text_run: { content: isCopy ? docText.replace('{{下发编号}}', created ? '20261029' : '{{下发编号}}') : docText } }] } }];
+        const items: Array<Record<string, unknown>> = [{ block_id: isCopy ? 'blockCopy' : 'blockSource', block_type: 2, text: { elements: [{ text_run: { content: isCopy ? docText.replace('{{下发编号}}', created ? '202610290001' : '{{下发编号}}') : docText } }] } }];
         if (options.docTitleMarker) items.unshift({ block_id: isCopy ? 'doxcnCopy' : 'doxcnSource', block_type: 1, page: { elements: [{ text_run: { content: isCopy ? pageTitle : '说明{{下发编号}}' } }] } });
         data = { items, has_more: false };
         // The copy starts from the original marker text until the batch update below.
@@ -171,11 +171,59 @@ describe('release materials', () => {
       .toBe('CorpFolderToken');
   });
 
-  it('maps the supplied version owner to the template spelling 版本负责任', async () => {
+  it('treats both version-owner spellings as independent optional fields', async () => {
     const { service } = fixture({ ownerTypo: true });
     const manifest = await service.prepare({ ...input, fields: { ...input.fields, 版本负责人: 'Topson' } });
-    expect(manifest.files[0].patches[0].after).toContain('Topson');
-    await expect(service.prepare({ ...input, fields: { ...input.fields, 版本负责人: 'Topson', 版本负责任: 'Other' } })).rejects.toThrow('不一致');
+    expect(manifest.files[0].patches[0].after).toContain('{{版本负责任}}');
+    expect(manifest.unusedFields).toEqual(['版本负责人']);
+    const exact = await service.prepare({ ...input, fields: { 版本负责任: 'Other' } });
+    expect(exact.files[0].patches[0].after).toContain('Other');
+  });
+  it('auto-fills only the 12-digit release ID and preserves all unrequested placeholders', async () => {
+    const { service, calls } = fixture();
+    const manifest = await service.prepare({ ...input, fields: {} });
+    expect(manifest.rulesVersion).toBe(2);
+    expect(manifest.input.fields).toEqual({ 下发编号: input.releaseId });
+    expect(manifest.files.map(file => file.patches.length)).toEqual([1, 0, 0]);
+    expect(manifest.files[0].patches[0].after).toContain(`${input.releaseId} / {{负责人}}`);
+    await service.executeJob(await approvedJob(service, manifest));
+    expect(calls.filter(call => call.method === 'PUT' && call.url.includes('/bitable/'))).toHaveLength(0);
+    expect(calls.filter(call => call.method === 'PUT' && call.url.includes('/sheets/'))).toHaveLength(0);
+  });
+  it('replaces multiple dynamic fields across different template types and leaves others intact', async () => {
+    const { service, calls } = fixture({ dynamicFields: true });
+    const manifest = await service.prepare({ ...input, fields: { 代理地址: 'proxy.example', 版本Tag: 'v2.1', 未命中: 'skip' } });
+    expect(manifest.unusedFields).toEqual(['未命中']);
+    expect(manifest.files.map(file => file.patches.flatMap(patch => patch.fields))).toEqual([
+      ['下发编号', '代理地址'], ['版本Tag'], ['代理地址'],
+    ]);
+    expect(manifest.files[0].patches[0].after).toContain('{{未指定}}');
+    expect(manifest.files[1].patches[0].after).toBe('Tag=v2.1 / {{未指定}}');
+    await service.executeJob(await approvedJob(service, manifest));
+    expect(calls.filter(call => call.method === 'PUT' && call.url.includes('/sheets/'))).toHaveLength(1);
+    expect(calls.filter(call => call.method === 'PUT' && call.url.includes('/bitable/'))).toHaveLength(1);
+  });
+  it('rejects missing or invalid release IDs and conflicting explicit field values before reading templates', async () => {
+    const { service, calls } = fixture();
+    await expect(service.prepare({ ...input, releaseId: '' })).rejects.toThrow('12 位数字');
+    await expect(service.prepare({ ...input, releaseId: '20261029' })).rejects.toThrow('12 位数字');
+    await expect(service.prepare({ ...input, fields: { 下发编号: '999999999999' } })).rejects.toThrow('必须与');
+    expect(calls).toHaveLength(0);
+  });
+  it('expires a pending approval created under the old replacement rules', async () => {
+    const { service } = fixture();
+    const manifest = await service.prepare({ ...input, releaseId: '202611030999' });
+    const legacy = { ...manifest } as { rulesVersion?: number };
+    delete legacy.rulesVersion;
+    const { jobId } = await service.createJob(caller, legacy as typeof manifest, 123456789);
+    const { proposeAction } = await import('../state/approvals');
+    const { expireLegacyReleaseJobs } = await import('../state/store');
+    const action = await proposeAction(caller, { kind: 'release_materials', jobId, releaseId: manifest.input.releaseId, fileCount: manifest.files.length, fieldSummary: '旧规则' });
+    const db = await stateDb();
+    await db.execute({ sql: 'UPDATE release_jobs SET approval_id = ? WHERE id = ?', args: [action.id, jobId] });
+    expect(await expireLegacyReleaseJobs()).toBe(1);
+    expect((await db.execute({ sql: 'SELECT status FROM release_jobs WHERE id = ?', args: [jobId] })).rows[0].status).toBe('expired');
+    expect((await db.execute({ sql: 'SELECT status FROM actions WHERE id = ?', args: [action.id] })).rows[0].status).toBe('expired');
   });
   it('previews all three template types with paginated Drive listing and no writes', async () => {
     const { service, calls } = fixture();
@@ -198,12 +246,12 @@ describe('release materials', () => {
     setOfficeTextSender(async (_chatId, text) => { messages.push(text); });
     setApprovalNotifier(async (_chatId, _actionId, summary) => { cards.push(summary); });
     try {
-      const result = await requestReleaseMaterials({ ...input, releaseId: '20261103' }, caller);
+      const result = await requestReleaseMaterials({ ...input, releaseId: '202611030001' }, caller);
       expect(result.status).toBe('pending');
       expect(messages).toHaveLength(1);
       expect(messages[0].length).toBeLessThan(2801);
       expect(messages[0]).toContain('3 个副本');
-      expect(messages[0]).toContain('说明.docx（docx）：1 处');
+      expect(messages[0]).toContain('说明.docx（docx）：2 处；下发编号、负责人');
       expect(messages[0]).not.toContain('text_run');
       expect(messages[0]).not.toContain('"elements"');
       expect(cards).toHaveLength(1);
@@ -240,7 +288,7 @@ describe('release materials', () => {
       const line = log.mock.calls.map(args => args.join(' ')).join('\n');
       expect(line).toContain('[prepareReleaseMaterialsTool] failed');
       expect(line).toContain('"phase":"preflight"');
-      expect(line).toContain('20261029');
+      expect(line).toContain('202610290001');
       expect(line).toContain('group');
       expect(line).not.toContain(input.materialsParentUrl);
     } finally { log.mockRestore(); setOfficeApi(undefined); }
@@ -276,7 +324,7 @@ describe('release materials', () => {
     expect(manifest.files[0].patches).toHaveLength(2);
     const jobId = await approvedJob(service, manifest);
     const result = await service.executeJob(jobId);
-    expect(result.files[0].name).toBe('说明20261029');
+    expect(result.files[0].name).toBe('说明202610290001');
     expect(calls.some(c => c.url === '/open-apis/drive/v1/files/doxcnCopy' && c.method === 'PATCH')).toBe(false);
     expect(calls.some(c => c.url.endsWith('/blocks/doxcnCopy') && c.method === 'PATCH')).toBe(false);
     const batch = calls.find(c => c.url.endsWith('/blocks/batch_update'));
@@ -287,7 +335,7 @@ describe('release materials', () => {
     const { service, calls } = fixture({ docTitleMarker: true, rejectSingleBlockGet: true });
     const manifest = await service.prepare(input);
     const result = await service.executeJob(await approvedJob(service, manifest));
-    expect(result.files[0].name).toBe('说明20261029');
+    expect(result.files[0].name).toBe('说明202610290001');
     expect(calls.filter(call => call.method === 'GET' && /\/docx\/v1\/documents\/[^/]+\/blocks\/[^/]+$/.test(call.url))).toHaveLength(0);
   });
 
@@ -304,8 +352,8 @@ describe('release materials', () => {
     const { service, calls } = fixture({ docTitleMarker: true, privateNoDriveRename: true, privateBatchRejectsPage: true, privateRejectsPagePatch: true });
     const manifest = await service.prepare(input);
     const result = await service.executeJob(await approvedJob(service, manifest));
-    expect(result.files[0].name).toBe('说明20261029');
-    expect(calls.find(call => call.url.endsWith('/doxcnSource/copy'))?.data).toMatchObject({ name: '说明20261029' });
+    expect(result.files[0].name).toBe('说明202610290001');
+    expect(calls.find(call => call.url.endsWith('/doxcnSource/copy'))?.data).toMatchObject({ name: '说明202610290001' });
     expect(calls.filter(call => call.url.endsWith('/blocks/doxcnCopy') && call.method === 'PATCH')).toHaveLength(0);
     expect(calls.filter(call => call.url.endsWith('/blocks/batch_update')).every(call =>
       (call.data as { requests: Array<{ block_id: string }> }).requests.every(request => request.block_id !== 'doxcnCopy'))).toBe(true);
@@ -320,18 +368,18 @@ describe('release materials', () => {
     for (const file of stored.files) delete file.pageTitle;
     await db.execute({ sql: 'UPDATE release_jobs SET manifest_json = ? WHERE id = ?', args: [JSON.stringify(stored), jobId] });
     const result = await service.executeJob(jobId);
-    expect(result.files[0].name).toBe('说明20261029');
+    expect(result.files[0].name).toBe('说明202610290001');
   });
 
   it('previews and renames a copied Sheets file title without changing the template', async () => {
     const { service, calls } = fixture({ sheetTitleMarker: true });
     const manifest = await service.prepare(input);
-    expect(manifest.files[1].patches[0]).toMatchObject({ location: '文件标题', before: '清单{{下发编号}}', after: '清单20261029', fileName: true });
+    expect(manifest.files[1].patches[0]).toMatchObject({ location: '文件标题', before: '清单{{下发编号}}', after: '清单202610290001', fileName: true });
     const jobId = await approvedJob(service, manifest);
     const result = await service.executeJob(jobId);
-    expect(result.files[1].name).toBe('清单20261029');
+    expect(result.files[1].name).toBe('清单202610290001');
     expect(calls.find(c => c.url === '/open-apis/drive/v1/files/shtCopy' && c.method === 'PATCH'))
-      .toMatchObject({ params: { type: 'sheet' }, data: { new_title: '清单20261029' } });
+      .toMatchObject({ params: { type: 'sheet' }, data: { new_title: '清单202610290001' } });
     expect(calls.some(c => c.url === '/open-apis/drive/v1/files/shtSource' && c.method === 'PATCH')).toBe(false);
     const writes = calls.filter(c => c.url.includes('/sheets/v2/') && c.method === 'PUT');
     expect(writes).toHaveLength(1);
@@ -359,22 +407,21 @@ describe('release materials', () => {
   it('writes a mixed-text spreadsheet placeholder only in the approved copy', async () => {
     const { service, calls } = fixture({ sheetMixedText: true });
     const manifest = await service.prepare(input);
-    expect(manifest.files[1].patches[0]).toMatchObject({ before: 'L_REL_{{下发编号}}', after: 'L_REL_20261029' });
+    expect(manifest.files[1].patches[0]).toMatchObject({ before: 'L_REL_{{下发编号}}', after: 'L_REL_202610290001' });
     await service.executeJob(await approvedJob(service, manifest));
     const writes = calls.filter(call => call.url.includes('/sheets/v2/') && call.method === 'PUT');
     expect(writes).toHaveLength(1);
-    expect(writes[0]).toMatchObject({ url: '/open-apis/sheets/v2/spreadsheets/shtCopy/values', data: { valueRange: { values: [['L_REL_20261029']] } } });
+    expect(writes[0]).toMatchObject({ url: '/open-apis/sheets/v2/spreadsheets/shtCopy/values', data: { valueRange: { values: [['L_REL_202610290001']] } } });
   });
 
   it('refuses to rename when the copied file title has changed since approval', async () => {
     const { service, calls } = fixture({ sheetTitleMarker: true });
-    await expect(service.renameFile('shtCopy', 'sheet', 'newFolder', 'different', '清单20261029')).rejects.toThrow('已变化');
+    await expect(service.renameFile('shtCopy', 'sheet', 'newFolder', 'different', '清单202610290001')).rejects.toThrow('已变化');
     expect(calls.some(c => c.method === 'PATCH')).toBe(false);
   });
 
-  it('stops before writes for unsupported types, missing values, duplicate folder and changed source', async () => {
+  it('stops before writes for unsupported types, duplicate folder and changed source', async () => {
     await expect(fixture({ unsupported: true }).service.prepare(input)).rejects.toThrow('不支持的类型');
-    await expect(fixture().service.prepare({ ...input, fields: { 日期: '2026-10-29' } })).rejects.toThrow('负责人');
     await expect(fixture({ duplicateFolder: true }).service.prepare(input)).rejects.toThrow('已有同名');
     const { service, calls } = fixture({ sourceChanged: true });
     const manifest = await service.prepare(input);

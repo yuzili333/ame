@@ -410,6 +410,10 @@ it('rechecks a completed release in Drive and starts a fresh approval if its fol
   setOfficeTextSender(async (_chatId, text) => { sent.push({ markdown: text }); });
   setApprovalNotifier(async (_chatId, id) => { sent.push({ cardApprovalId: id }); });
   try {
+    const changedFieldsHandled = await Reflect.get(gateway, 'handleKnownReleaseRequest').call(gateway,
+      `请再次下发 ${input.releaseId} ${input.templateFolderUrl} ${input.materialsParentUrl} Topson，代理地址字段更新为 proxy.example`, caller, 'changed-fields', 1500);
+    expect(changedFieldsHandled).toBe(false);
+    expect(sent).toHaveLength(0);
     const handled = await Reflect.get(gateway, 'handleKnownReleaseRequest').call(gateway,
       `请再次下发 ${input.releaseId} ${input.templateFolderUrl} ${input.materialsParentUrl} Topson`, caller, 'message-1', 2000);
     expect(handled).toBe(true);
@@ -445,7 +449,7 @@ it('explains a release retry preflight failure instead of silently dropping the 
   const gateway = new FeishuGateway(channel);
   const requester = { userId: 'u1', chatId: 'g1', chatType: 'group' as const };
   const service = new ReleaseMaterialsService(gateway.office);
-  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-view', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-view', releaseId: '202610291639', fields: { 负责人: 'Topson' } }, templateFolderToken: 'template-view', materialsParentToken: 'parent-view', files: [], ignoredFolders: [] };
+  const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-view', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-view', releaseId: '202610291639', fields: { 负责人: 'Topson' } }, templateFolderToken: 'template-view', materialsParentToken: 'parent-view', files: [], ignoredFolders: [] };
   const oldJob = await service.createJob(requester, manifest, 3000);
   const db = await store.stateDb();
   await db.execute({ sql: "UPDATE release_jobs SET status = 'failed' WHERE id = ?", args: [oldJob.jobId] });
@@ -475,7 +479,7 @@ it('does not relay an Agent claim that a failed release approval is still pendin
     send: async (_chatId: string, payload: { markdown?: string; text?: string }) => { sent.push(payload.markdown ?? payload.text ?? ''); return {}; },
   } as unknown as LarkChannel);
   const requester = { userId: 'u1', chatId: 'g1', chatType: 'group' as const };
-  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-stale', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-stale', releaseId: '202610291640', fields: { 负责人: 'Topson' } }, templateFolderToken: 'template-stale', materialsParentToken: 'parent-stale', files: [], ignoredFolders: [] };
+  const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-stale', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-stale', releaseId: '202610291640', fields: { 负责人: 'Topson' } }, templateFolderToken: 'template-stale', materialsParentToken: 'parent-stale', files: [], ignoredFolders: [] };
   const service = new ReleaseMaterialsService(gateway.office);
   const job = await service.createJob(requester, manifest, 5000);
   const action = await approvals.proposeAction(requester, { kind: 'release_materials', jobId: job.jobId, releaseId: manifest.input.releaseId, fileCount: 1, fieldSummary: '负责人=Topson' });
@@ -506,7 +510,7 @@ it('grounds a new release reply in its own pending job instead of historical app
     send: async (_chatId: string, payload: { markdown?: string; text?: string }) => { sent.push(payload.markdown ?? payload.text ?? ''); return {}; },
   } as unknown as LarkChannel);
   const requester = { userId: 'u-ground', chatId: 'g-ground', chatType: 'group' as const };
-  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-ground', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-ground', releaseId: '202610300856', fields: { 版本负责人: 'Ana', 下发日期: '20261031' } }, templateFolderToken: 'template-ground', materialsParentToken: 'parent-ground', files: [], ignoredFolders: [] };
+  const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-ground', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-ground', releaseId: '202610300856', fields: { 版本负责人: 'Ana', 下发日期: '20261031' } }, templateFolderToken: 'template-ground', materialsParentToken: 'parent-ground', files: [], ignoredFolders: [] };
   const job = await new ReleaseMaterialsService(gateway.office).createJob(requester, manifest, 1793321832959);
   const action = await approvals.proposeAction(requester, { kind: 'release_materials', jobId: job.jobId, releaseId: '202610300856', fileCount: 1, fieldSummary: 'Ana' });
   await (await store.stateDb()).execute({ sql: 'UPDATE release_jobs SET approval_id = ? WHERE id = ?', args: [action.id, job.jobId] });
@@ -536,7 +540,7 @@ it('does not send a separate running message after the original release request 
     send: async (_chatId: string, payload: { markdown?: string; text?: string }) => { sent.push(payload.markdown ?? payload.text ?? ''); return {}; },
   } as unknown as LarkChannel);
   const requester = { userId: 'u-progress', chatId: 'g-progress', chatType: 'group' as const, messageId: 'release-original' };
-  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-progress', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-progress', releaseId: '202611030909', fields: { 负责人: 'Ana' } }, templateFolderToken: 'template-progress', materialsParentToken: 'parent-progress', files: [], ignoredFolders: [] };
+  const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-progress', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-progress', releaseId: '202611030909', fields: { 负责人: 'Ana' } }, templateFolderToken: 'template-progress', materialsParentToken: 'parent-progress', files: [], ignoredFolders: [] };
   const { jobId } = await new ReleaseMaterialsService(gateway.office).createJob(requester, manifest);
   const action = await approvals.proposeAction(requester, { kind: 'release_materials', jobId, releaseId: manifest.input.releaseId, fileCount: 1, fieldSummary: '负责人=Ana' });
   const db = await store.stateDb();
@@ -563,7 +567,7 @@ it('reports the completed release when the requester follows up with confirmatio
     send: async (_chatId: string, payload: { markdown?: string; text?: string }) => { sent.push(payload.markdown ?? payload.text ?? ''); return {}; },
   } as unknown as LarkChannel);
   const requester = { userId: 'u-confirm', chatId: 'g-confirm', chatType: 'group' as const };
-  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-confirm', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-confirm', releaseId: '202610300857', fields: { 版本负责人: 'Ana' } }, templateFolderToken: 'template-confirm', materialsParentToken: 'parent-confirm', files: [], ignoredFolders: [] };
+  const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-confirm', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-confirm', releaseId: '202610300857', fields: { 版本负责人: 'Ana' } }, templateFolderToken: 'template-confirm', materialsParentToken: 'parent-confirm', files: [], ignoredFolders: [] };
   const job = await new ReleaseMaterialsService(gateway.office).createJob(requester, manifest, 1793321832959);
   await (await store.stateDb()).execute({ sql: "UPDATE release_jobs SET status = 'completed', folder_url = ?, result_json = ?, updated_at = ? WHERE id = ?", args: ['https://feishu.cn/drive/folder/finished-confirm', JSON.stringify({ folderUrl: 'https://feishu.cn/drive/folder/finished-confirm', files: [{ name: '清单', url: 'https://feishu.cn/sheets/sheet-confirm' }] }), Date.now(), job.jobId] });
   await gateway.onMessage({ messageId: 'confirmed-release-followup', senderId: requester.userId, chatId: requester.chatId, chatType: 'group', content: '通过新批次的审批卡片', mentionedBot: true, rawContentType: 'text', resources: [], mentions: [], mentionAll: false, createTime: Date.now() });
@@ -582,7 +586,7 @@ it('keeps a confirmation follow-up quiet while the release progress card is runn
     send: async (_chatId: string, payload: { markdown?: string; text?: string }) => { sent.push(payload.markdown ?? payload.text ?? ''); return {}; },
   } as unknown as LarkChannel);
   const requester = { userId: 'u-confirm-running', chatId: 'g-confirm-running', chatType: 'group' as const };
-  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-running', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-running', releaseId: '202611030911', fields: {} }, templateFolderToken: 'template-running', materialsParentToken: 'parent-running', files: [], ignoredFolders: [] };
+  const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-running', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-running', releaseId: '202611030911', fields: {} }, templateFolderToken: 'template-running', materialsParentToken: 'parent-running', files: [], ignoredFolders: [] };
   const { jobId } = await new ReleaseMaterialsService(gateway.office).createJob(requester, manifest);
   await (await store.stateDb()).execute({ sql: "UPDATE release_jobs SET status = 'running' WHERE id = ?", args: [jobId] });
   await gateway.onMessage({ messageId: 'confirm-running', senderId: requester.userId, chatId: requester.chatId, chatType: 'group', content: '确认', mentionedBot: true, rawContentType: 'text', resources: [], mentions: [], mentionAll: false, createTime: Date.now() });
@@ -597,7 +601,7 @@ it('expires an overdue release approval before deciding whether a retry may star
   const { ReleaseMaterialsService } = await import('../office/release-materials');
   const gateway = new FeishuGateway({ rawClient: { request: async () => ({ code: 0, data: {} }) }, send: async () => ({}) } as unknown as LarkChannel);
   const requester = { userId: 'u1', chatId: 'g1', chatType: 'group' as const };
-  const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-expired', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-expired', releaseId: '202610291641', fields: { 负责人: 'Topson' } }, templateFolderToken: 'template-expired', materialsParentToken: 'parent-expired', files: [], ignoredFolders: [] };
+  const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template-expired', materialsParentUrl: 'https://feishu.cn/drive/folder/parent-expired', releaseId: '202610291641', fields: { 负责人: 'Topson' } }, templateFolderToken: 'template-expired', materialsParentToken: 'parent-expired', files: [], ignoredFolders: [] };
   const job = await new ReleaseMaterialsService(gateway.office).createJob(requester, manifest, 6000);
   const action = await approvals.proposeAction(requester, { kind: 'release_materials', jobId: job.jobId, releaseId: manifest.input.releaseId, fileCount: 1, fieldSummary: '负责人=Topson' });
   const db = await store.stateDb();

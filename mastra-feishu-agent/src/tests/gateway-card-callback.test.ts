@@ -53,7 +53,7 @@ describe('private Feishu card callback acknowledgement', () => {
     const { ReleaseMaterialsService } = await import('../office/release-materials');
     const channel = { rawClient: {}, updateCard: async () => undefined } as unknown as LarkChannel;
     const gateway = new FeishuGateway(channel);
-    const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template', materialsParentUrl: 'https://feishu.cn/drive/folder/parent', releaseId: '202611030909', fields: {} }, templateFolderToken: 'template', materialsParentToken: 'parent', ignoredFolders: [], files: [
+    const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template', materialsParentUrl: 'https://feishu.cn/drive/folder/parent', releaseId: '202611030909', fields: {} }, templateFolderToken: 'template', materialsParentToken: 'parent', ignoredFolders: [], files: [
       { token: 'doc1', name: '下发步骤', type: 'docx', patches: [], fingerprint: 'one' },
       { token: 'sheet1', name: '检查单', type: 'sheet', patches: [], fingerprint: 'two' },
     ] };
@@ -75,7 +75,7 @@ describe('private Feishu card callback acknowledgement', () => {
     const { ReleaseMaterialsService } = await import('../office/release-materials');
     const updates: string[] = [];
     const gateway = new FeishuGateway({ rawClient: {}, updateCard: async (_id: string, card: unknown) => { updates.push(JSON.stringify(card)); } } as unknown as LarkChannel);
-    const manifest = { input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template', materialsParentUrl: 'https://feishu.cn/drive/folder/parent', releaseId: '202611030910', fields: {} }, templateFolderToken: 'template', materialsParentToken: 'parent', ignoredFolders: [], files: [
+    const manifest = { rulesVersion: 2 as const, input: { templateFolderUrl: 'https://feishu.cn/drive/folder/template', materialsParentUrl: 'https://feishu.cn/drive/folder/parent', releaseId: '202611030910', fields: {} }, templateFolderToken: 'template', materialsParentToken: 'parent', ignoredFolders: [], files: [
       { token: 'doc2', name: '回退步骤', type: 'docx', patches: [], fingerprint: 'one' },
     ] };
     const { jobId } = await new ReleaseMaterialsService(gateway.office).createJob({ userId: 'ou_user', chatId: 'oc_chat', chatType: 'p2p' }, manifest);
