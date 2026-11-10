@@ -3,6 +3,8 @@ import { resolve } from 'node:path';
 import { z } from 'zod';
 import { normalizeChatBaseURL, normalizeProxyModelName } from './model-url';
 
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const optionalText = z.string().trim().optional().transform(value => value || undefined);
 const optionalUrl = optionalText.pipe(z.string().url().optional());
 const envSchema = z.object({
