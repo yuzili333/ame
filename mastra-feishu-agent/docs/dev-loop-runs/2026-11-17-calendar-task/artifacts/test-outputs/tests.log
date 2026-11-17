@@ -1,0 +1,13 @@
+
+> mastra-feishu-agent@1.0.0 test
+> vitest run
+
+
+ RUN  v5.0.5 /Users/yuzili/dev/ame/mastra-feishu-agent
+
+
+ Test Files  20 passed (20)
+      Tests  197 passed (197)
+   Start at  14:22:21
+   Duration  7.38s (tests 89%, import 10%, transform 1%)
+

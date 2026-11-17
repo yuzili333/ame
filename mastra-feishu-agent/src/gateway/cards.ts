@@ -28,6 +28,7 @@ export function resolvedCard(status: string, detail?: string) {
   const labels: Record<string, string> = {
     succeeded: '已执行成功', denied: '已拒绝', expired: '确认已超时', interrupted: '服务重启，原操作已失效',
     resumed: '工具调用已放行，业务结果请查看后续消息',
+    authorization_pending: '等待用户授权，原操作尚未执行',
     failed: '执行失败，请检查日志与目标资源后重新发起', executing: '正在执行', pending: '等待确认',
   };
   return {

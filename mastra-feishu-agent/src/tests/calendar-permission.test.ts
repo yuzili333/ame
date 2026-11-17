@@ -256,7 +256,7 @@ it('does not send an old agent summary when the requester cancels a new permissi
 
 it('persists the user-requested tomorrow date from trusted Feishu context before asking for authorization', async () => {
   const { createCalendarTool } = await import('../mastra/tools/office-tools');
-  permission.setPermissionNotifier(async () => undefined);
+  bridge.setApprovalNotifier(async () => undefined);
   const requestContext = { get: (key: string) => ({
     caller,
     originalMessage: '请为我创建一个明天上午9点到10点的会议日程，主题是10月工作总结大会',
@@ -265,5 +265,5 @@ it('persists the user-requested tomorrow date from trusted Feishu context before
   const execute = Reflect.get(createCalendarTool, 'execute') as (input: unknown, context: unknown) => Promise<{ requestId: string }>;
   const result = await execute({ permissionMode: 'auto', summary: '10月工作总结大会', startTime: '1792717200', endTime: '1792720800' }, { requestContext });
   const stored = await (await store.stateDb()).execute({ sql: 'SELECT payload FROM permission_requests WHERE id = ?', args: [result.requestId] });
-  expect(JSON.parse(String(stored.rows[0]?.payload))).toMatchObject({ startTime: '1793062800', endTime: '1793066400' });
+  expect(JSON.parse(String(stored.rows[0]?.payload))).toMatchObject({ intent: { startTime: '1793062800', endTime: '1793066400' } });
 });

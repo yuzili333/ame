@@ -1,11 +1,12 @@
 import { withUserAccessToken, type Client, type LarkChannel } from '@larksuiteoapi/node-sdk';
 import { config } from '../config';
 import type { OfficeAction } from './actions';
+import { assertTaskTimeRange } from './task-time';
 import { TableService } from './table-service';
 import { ReleaseMaterialsService } from './release-materials';
 
 type ApiResult = { code?: number; msg?: string; data?: Record<string, unknown>; error?: { log_id?: string; field_violations?: Array<{ field?: string; description?: string }> } };
-export type ApiRequest = { method: 'GET' | 'POST' | 'PATCH' | 'PUT'; url: string; data?: unknown; params?: Record<string, unknown>; userAccessToken?: string };
+export type ApiRequest = { method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'; url: string; data?: unknown; params?: Record<string, unknown>; userAccessToken?: string };
 export type OfficeTransport = { request(request: ApiRequest): Promise<ApiResult>; send(chatId: string, text: string): Promise<unknown> };
 
 export function createOfficeTransport(channel: LarkChannel): OfficeTransport {
@@ -57,6 +58,7 @@ export class OfficeApi {
       }
       const status = response?.status
         ?? (error as { status?: number })?.status;
+      if (status === 401 || status === 403) throw apiError(request, { code: status, msg: '身份认证或资源权限不足' });
       if (status === 404 || status === 405 || status === 501) {
         throw new Error(`This private Feishu deployment does not provide ${request.method} ${safeEndpoint(request.url)}`);
       }
@@ -79,30 +81,46 @@ export class OfficeApi {
     return this.api({ method: 'GET', url: `/open-apis/docx/v1/documents/${id(documentId)}/raw_content` });
   }
 
-  async readCalendar(calendarId: string, startTime: string, endTime: string) {
-    return this.api({ method: 'GET', url: `/open-apis/calendar/v4/calendars/${id(calendarId)}/events`, params: { start_time: startTime, end_time: endTime } });
+  async readCalendar(calendarId: string, startTime: string, endTime: string, userAccessToken?: string, pageToken?: string) {
+    return this.api({ method: 'GET', url: `/open-apis/calendar/v4/calendars/${id(calendarId)}/events`, params: { start_time: startTime, end_time: endTime, ...(pageToken ? { page_token: pageToken } : {}) }, userAccessToken });
   }
 
-  async primaryCalendar(userAccessToken: string): Promise<string> {
+  async primaryCalendar(userAccessToken: string, requireWrite = true): Promise<string> {
     const data = await this.api({ method: 'POST', url: '/open-apis/calendar/v4/calendars/primary', userAccessToken });
     const entries = data.calendars as Array<{ calendar?: { calendar_id?: string; type?: string; role?: string } }> | undefined;
     const calendar = entries?.find(entry => entry.calendar?.type === 'primary')?.calendar ?? entries?.[0]?.calendar;
-    if (!calendar?.calendar_id || !['owner', 'writer'].includes(calendar.role ?? '')) throw new Error('用户主日历不存在或没有写入权限');
+    if (!calendar?.calendar_id || (requireWrite && !['owner', 'writer'].includes(calendar.role ?? ''))) throw new Error('用户主日历不存在或没有写入权限');
     return calendar.calendar_id;
   }
 
   async assertCalendarWritable(calendarId: string, userAccessToken: string): Promise<void> {
     const data = await this.api({ method: 'GET', url: `/open-apis/calendar/v4/calendars/${id(calendarId)}`, userAccessToken });
-    const calendar = data.calendar as { role?: string } | undefined;
+    const calendar = (data.calendar ?? data) as { role?: string } | undefined;
     if (!calendar || !['owner', 'writer'].includes(calendar.role ?? '')) throw new Error('当前用户没有该日历的写入权限');
   }
 
-  async readTask(taskId: string) {
-    return this.api({ method: 'GET', url: `/open-apis/task/v2/tasks/${id(taskId)}` });
+  async readTask(taskId: string, userAccessToken?: string) {
+    return this.api({ method: 'GET', url: `/open-apis/task/v2/tasks/${id(taskId)}`, userAccessToken });
   }
 
-  async execute(action: OfficeAction, executionKey?: string, userAccessToken?: string): Promise<unknown> {
+  async execute(action: OfficeAction, executionKey?: string, userAccessToken?: string, requesterId?: string): Promise<unknown> {
+    if ('permissionMode' in action && action.permissionMode === 'user' && !userAccessToken) throw new Error('缺少请求者的用户授权，请重新授权后继续');
+    const selectedToken = 'permissionMode' in action && action.permissionMode === 'user' ? userAccessToken : undefined;
     switch (action.kind) {
+      case 'resource_authorize': throw new Error('用户授权必须由审批网关处理');
+      case 'calendar_container_create':
+        return this.api({ method: 'POST', url: '/open-apis/calendar/v4/calendars', userAccessToken: selectedToken, data: { summary: action.summary, description: action.description, permissions: action.permissions } });
+      case 'calendar_container_update': {
+        const data = Object.fromEntries(Object.entries({ summary: action.summary, description: action.description, permissions: action.permissions }).filter(([, value]) => value !== undefined));
+        if (!Object.keys(data).length) throw new Error('No calendar fields to update');
+        return this.api({ method: 'PATCH', url: `/open-apis/calendar/v4/calendars/${id(action.calendarId)}`, data, userAccessToken: selectedToken });
+      }
+      case 'calendar_container_delete':
+        return this.api({ method: 'DELETE', url: `/open-apis/calendar/v4/calendars/${id(action.calendarId)}`, userAccessToken: selectedToken });
+      case 'calendar_delete':
+        return this.api({ method: 'DELETE', url: `/open-apis/calendar/v4/calendars/${id(action.calendarId)}/events/${id(action.eventId)}`, userAccessToken: selectedToken });
+      case 'task_delete':
+        return this.api({ method: 'DELETE', url: `/open-apis/task/v2/tasks/${id(action.taskId)}`, userAccessToken: selectedToken });
       case 'doc_create': {
         const created = await this.api({ method: 'POST', url: '/open-apis/docx/v1/documents', data: { title: action.title, folder_token: action.folderToken } });
         if (!action.content) return created;
@@ -142,18 +160,24 @@ export class OfficeApi {
         return this.api({ method: 'PATCH', url: `/open-apis/calendar/v4/calendars/${id(action.calendarId)}/events/${id(action.eventId)}`, data, userAccessToken: action.permissionMode === 'user' ? userAccessToken : undefined });
       }
       case 'task_create':
-        return this.api({ method: 'POST', url: '/open-apis/task/v2/tasks', data: {
+        assertTaskTimeRange(action);
+        return this.api({ method: 'POST', url: '/open-apis/task/v2/tasks', userAccessToken: selectedToken, params: { user_id_type: 'open_id' }, data: {
           summary: action.summary, description: action.description,
-          due: action.dueTimestamp ? { timestamp: action.dueTimestamp } : undefined,
+          ...(selectedToken && requesterId ? { members: [{ id: requesterId, type: 'user', role: 'assignee' }] } : {}),
+          start: action.startTimestamp ? { timestamp: action.startTimestamp, is_all_day: false } : undefined,
+          due: action.dueTimestamp ? { timestamp: action.dueTimestamp, is_all_day: false } : undefined,
           client_token: executionKey,
         } });
       case 'task_update': {
+        assertTaskTimeRange(action);
         const task: Record<string, unknown> = {};
         if (action.summary !== undefined) task.summary = action.summary;
         if (action.description !== undefined) task.description = action.description;
-        if (action.dueTimestamp !== undefined) task.due = { timestamp: action.dueTimestamp };
+        if (action.startTimestamp !== undefined) task.start = { timestamp: action.startTimestamp, is_all_day: false };
+        if (action.dueTimestamp !== undefined) task.due = { timestamp: action.dueTimestamp, is_all_day: false };
+        if (action.completedAt !== undefined) task.completed_at = action.completedAt;
         if (!Object.keys(task).length) throw new Error('No task fields to update');
-        return this.api({ method: 'PATCH', url: `/open-apis/task/v2/tasks/${id(action.taskId)}`, data: { task, update_fields: Object.keys(task) } });
+        return this.api({ method: 'PATCH', url: `/open-apis/task/v2/tasks/${id(action.taskId)}`, data: { task, update_fields: Object.keys(task) }, userAccessToken: selectedToken });
       }
       case 'message_send':
         if (!config.allowedChats.has(action.targetChatId)) throw new Error('Target chat is not allowlisted');

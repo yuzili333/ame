@@ -5,7 +5,8 @@ import type { Caller } from '../../identity';
 import { officeAction, type OfficeAction } from '../../office/actions';
 import { getOfficeApi } from '../../runtime/office-bridge';
 import { requestOfficeApproval } from '../../runtime/approval-bridge';
-import { requestCalendarPermission } from '../../office/permission-choice';
+import { requestResourceOperation } from '../../office/resource-permission';
+import { isResourceWrite, resourceRead, type ResourceRead } from '../../office/resource-operation';
 import { reconcileRelativeCalendarDate } from '../../office/calendar-time';
 import { tableIntent, type TableIntent } from '../../office/table-service';
 import { TableService } from '../../office/table-service';
@@ -15,12 +16,16 @@ import { sendOfficeText } from '../../runtime/office-bridge';
 import { isMessageRecalled, stateDb } from '../../state/store';
 
 const token = z.string().min(1).max(256).regex(/^[\w@.-]+$/);
-const time = z.string().regex(/^\d{10}$/);
 
 function callerFrom(context: { requestContext: { get: (key: string) => unknown } }): Caller {
   const value = context.requestContext.get('caller') as Caller | undefined;
   if (!value?.userId || !value.chatId || !value.chatType) throw new Error('Trusted Feishu caller context is required');
   return value;
+}
+function continuationFrom(context: { requestContext: { get: (key: string) => unknown } }) {
+  const originalMessage = context.requestContext.get('originalMessage');
+  const messageCreatedAt = context.requestContext.get('messageCreatedAt');
+  return typeof originalMessage === 'string' && typeof messageCreatedAt === 'number' ? { originalMessage, messageCreatedAt } : undefined;
 }
 
 function actionTool<T extends OfficeAction['kind']>(kind: T, description: string) {
@@ -42,7 +47,7 @@ function actionTool<T extends OfficeAction['kind']>(kind: T, description: string
           action = reconcileRelativeCalendarDate(action, originalMessage, messageCreatedAt);
         }
       }
-      if (action.kind === 'calendar_create' || action.kind === 'calendar_update') return requestCalendarPermission(caller, action);
+      if (isResourceWrite(action)) return requestResourceOperation(caller, action, continuationFrom(context));
       return requestOfficeApproval(caller, action);
     },
   });
@@ -62,23 +67,29 @@ export const readDocumentTool = createTool({
     return api.readDocument(resource.token);
   },
 });
-export const readCalendarTool = createTool({
-  id: 'office_read_calendar', description: 'List events in an app-accessible calendar between Unix timestamps.',
-  inputSchema: z.object({ calendarId: token, startTime: time, endTime: time }),
-  execute: async ({ calendarId, startTime, endTime }) => getOfficeApi().readCalendar(calendarId, startTime, endTime),
-});
-export const readTaskTool = createTool({
-  id: 'office_read_task', description: 'Read an app-accessible Feishu task by task GUID.',
-  inputSchema: z.object({ taskId: token }),
-  execute: async ({ taskId }) => getOfficeApi().readTask(taskId),
-});
+function resourceReadTool(kind: ResourceRead['kind'], id: string, description: string) {
+  const schema = resourceRead.options.find(option => option.shape.kind.value === kind)!;
+  return createTool({ id, description, inputSchema: (schema as z.ZodObject<z.ZodRawShape>).omit({ kind: true }),
+    execute: async (input, context) => requestResourceOperation(callerFrom(context), { ...input, kind } as ResourceRead, continuationFrom(context)) });
+}
+export const readCalendarTool = resourceReadTool('calendar_events', 'office_read_calendar', 'List events in a personal or shared calendar in Unix seconds. Omit calendarId for the requester primary calendar. Default user identity; explicitly use app for robot-accessible shared calendars. Supports pageToken. Missing authorization sends a consent card and resumes this query after OAuth.');
+export const listCalendarsTool = resourceReadTool('calendar_list', 'office_list_calendars', 'List personal and subscribed shared calendars visible to the requester, including IDs, types and roles. Supports pagination. Use app only for robot calendars.');
+export const readCalendarInfoTool = resourceReadTool('calendar_read', 'office_read_calendar_info', 'Read calendar entity metadata and access role. Omit calendarId for the requester primary calendar.');
+export const readCalendarEventTool = resourceReadTool('calendar_event_read', 'office_read_calendar_event', 'Read one event by verified calendarId and eventId using requester identity, or explicit app identity.');
+export const readTaskTool = resourceReadTool('task_read', 'office_read_task', 'Read the requester task by verified task GUID. Missing user authorization sends a consent card and resumes after OAuth.');
+export const listTasksTool = resourceReadTool('task_list', 'office_list_tasks', 'List the requester assigned tasks (我负责的), optionally filter completed and continue with pageToken. This API does not list every task in the tenant.');
 
 export const createDocumentTool = actionTool('doc_create', 'Propose creating a Feishu document. Requires requester approval.');
 export const updateDocumentTool = actionTool('doc_update', 'Propose replacing the text of one Feishu document block. Requires requester approval.');
-export const createCalendarTool = actionTool('calendar_create', 'Create a calendar event. Omit calendarId for the requester personal calendar. Set permissionMode=user for personal calendar, app for a shared calendar. If user permission is missing, ask the requester to choose and authorize before sending any write approval card.');
-export const updateCalendarTool = actionTool('calendar_update', 'Update a calendar event. Set permissionMode=user when modifying the requester personal calendar, app for an app-accessible shared calendar. Missing user permission triggers a question before approval.');
-export const createTaskTool = actionTool('task_create', 'Propose creating a Feishu task. Requires requester approval.');
-export const updateTaskTool = actionTool('task_update', 'Propose updating a Feishu task. Requires requester approval.');
+export const createCalendarTool = actionTool('calendar_create', 'Create an event, not a calendar entity. Omit calendarId for the requester primary calendar. Default user identity, app only for robot-accessible shared calendars. Missing permission triggers authorization consent before operation approval.');
+export const updateCalendarTool = actionTool('calendar_update', 'Update an event in the selected personal or shared calendar. Default user identity. Missing permission triggers authorization consent; writing requires requester approval.');
+export const deleteCalendarTool = actionTool('calendar_delete', 'Delete one event by verified calendarId and eventId. Requires requester approval; missing permissions trigger authorization consent.');
+export const createCalendarContainerTool = actionTool('calendar_container_create', 'Create a shared calendar entity under the requester identity, or explicit app identity. The personal primary calendar cannot be created via this API. Requires approval.');
+export const updateCalendarContainerTool = actionTool('calendar_container_update', 'Edit the selected calendar entity title, description or visibility; requires owner role and requester approval.');
+export const deleteCalendarContainerTool = actionTool('calendar_container_delete', 'Delete the entire explicitly selected shared calendar including its events. Requires owner role and requester approval. Never use for deleting an event or the personal primary calendar.');
+export const createTaskTool = actionTool('task_create', 'Create a task as the requester (default user identity). startTimestamp and dueTimestamp are Unix milliseconds; a requested time range must populate both, not only the description. Missing authorization sends a consent card, OAuth resumes the request, then operation approval is required.');
+export const updateTaskTool = actionTool('task_update', 'Edit a requester task. startTimestamp and dueTimestamp are Unix milliseconds for the start and deadline. completedAt is Unix milliseconds, or 0 to reopen. Missing authorization triggers consent; writing requires approval.');
+export const deleteTaskTool = actionTool('task_delete', 'Delete the explicitly selected requester task by task GUID. Missing authorization triggers consent; deletion requires approval.');
 export const sendMessageTool = actionTool('message_send', 'Propose sending a message to another allowlisted Feishu chat. Only users in FEISHU_ALLOWED_USERS may use this tool; requester approval is required.');
 
 function tableTool<T extends TableIntent['operation']>(operation: T, description: string) {
@@ -183,6 +194,8 @@ export async function requestReleaseMaterials(input: z.infer<typeof releaseInput
 
 export const officeTools = {
   readDocumentTool, readCalendarTool, readTaskTool,
+  listCalendarsTool, readCalendarInfoTool, readCalendarEventTool, listTasksTool,
+  createCalendarContainerTool, updateCalendarContainerTool, deleteCalendarContainerTool, deleteCalendarTool, deleteTaskTool,
   createDocumentTool, updateDocumentTool, createCalendarTool, updateCalendarTool,
   createTaskTool, updateTaskTool, sendMessageTool,
   inspectTableTool, fillFirstEmptySheetCellTool, appendSheetRowTool, updateSheetCellTool,

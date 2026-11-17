@@ -26,7 +26,7 @@ export async function latestPermissionRequestId(caller: Caller): Promise<string 
 }
 
 function isCalendarAuthorizationError(error: unknown): boolean {
-  return /Feishu API (403|99991672|99991676|99991677|99991679|191002|193002)|用户日历授权已过期|没有该日历的写入权限|没有写入权限/.test(String(error));
+  return /Feishu API (403|99991672|99991676|99991677|99991679|191002|193002)|用户(?:日历)?授权已过期|没有该日历的写入权限|没有写入权限/.test(String(error));
 }
 
 async function createPending(caller: Caller, action: CalendarAction, reauthorize = false) {

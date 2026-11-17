@@ -14,8 +14,14 @@ export const officeAction = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('doc_update'), documentId: token, blockId: token, text }),
   z.object({ kind: z.literal('calendar_create'), calendarId: token.optional(), permissionMode: z.enum(['auto', 'user', 'app']).optional(), summary: text.max(255), description: text.optional(), startTime: calendarTimestamp, endTime: calendarTimestamp }),
   z.object({ kind: z.literal('calendar_update'), calendarId: token, permissionMode: z.enum(['user', 'app']).optional(), eventId: token, summary: text.max(255).optional(), description: text.optional(), startTime: calendarTimestamp.optional(), endTime: calendarTimestamp.optional() }),
-  z.object({ kind: z.literal('task_create'), summary: text.max(255), description: text.optional(), dueTimestamp: taskTimestamp.optional() }),
-  z.object({ kind: z.literal('task_update'), taskId: token, summary: text.max(255).optional(), description: text.optional(), dueTimestamp: taskTimestamp.optional() }),
+  z.object({ kind: z.literal('calendar_delete'), calendarId: token, eventId: token, permissionMode: tableIdentity.optional() }),
+  z.object({ kind: z.literal('calendar_container_create'), summary: text.max(255), description: text.optional(), permissions: z.enum(['private', 'show_only_free_busy', 'public']).optional(), permissionMode: tableIdentity.optional() }),
+  z.object({ kind: z.literal('calendar_container_update'), calendarId: token, summary: text.max(255).optional(), description: text.optional(), permissions: z.enum(['private', 'show_only_free_busy', 'public']).optional(), permissionMode: tableIdentity.optional() }),
+  z.object({ kind: z.literal('calendar_container_delete'), calendarId: token, permissionMode: tableIdentity.optional() }),
+  z.object({ kind: z.literal('task_create'), summary: text.max(255), description: text.optional(), startTimestamp: taskTimestamp.optional(), dueTimestamp: taskTimestamp.optional(), permissionMode: tableIdentity.optional() }),
+  z.object({ kind: z.literal('task_update'), taskId: token, summary: text.max(255).optional(), description: text.optional(), startTimestamp: taskTimestamp.optional(), dueTimestamp: taskTimestamp.optional(), completedAt: z.union([z.literal('0'), taskTimestamp]).optional(), permissionMode: tableIdentity.optional() }),
+  z.object({ kind: z.literal('task_delete'), taskId: token, permissionMode: tableIdentity.optional() }),
+  z.object({ kind: z.literal('resource_authorize'), requestId: z.string().uuid(), resource: z.enum(['calendar', 'task']), summary: text }),
   z.object({ kind: z.literal('message_send'), targetChatId: token, text }),
   z.object({ kind: z.literal('sheet_cell_set'), spreadsheetToken: token, sheetId: token, cell: z.string().regex(/^[A-Z]{1,3}[1-9]\d{0,6}$/), expectedValue: cellValue.nullable(), value: cellValue, permissionMode: tableIdentity }),
   z.object({ kind: z.literal('sheet_row_append'), spreadsheetToken: token, sheetId: token, headers: z.array(z.string()).min(1).max(256), values: z.array(cellValue.nullable()).min(1).max(256), permissionMode: tableIdentity }),
@@ -35,8 +41,14 @@ export function actionSummary(action: OfficeAction): string {
     case 'doc_update': return `修改文档 ${action.documentId} 的块 ${action.blockId}：${action.text.slice(0, 180)}`;
     case 'calendar_create': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份在日历 ${action.calendarId ?? '未指定'} 创建日程：${action.summary}（北京时间 ${formatShanghaiTime(action.startTime)}—${formatShanghaiTime(action.endTime)}）`;
     case 'calendar_update': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份修改日程 ${action.eventId}：${action.summary ?? '时间或说明'}${action.startTime || action.endTime ? `（北京时间 ${action.startTime ? formatShanghaiTime(action.startTime) : '原开始时间'}—${action.endTime ? formatShanghaiTime(action.endTime) : '原结束时间'}）` : ''}`;
-    case 'task_create': return `创建任务：${action.summary}`;
-    case 'task_update': return `修改任务 ${action.taskId}：${action.summary ?? '说明或截止时间'}`;
+    case 'calendar_delete': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份删除日历 ${action.calendarId} 的日程 ${action.eventId}`;
+    case 'calendar_container_create': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份新建共享日历：${action.summary}${action.description ? `；说明：${action.description.slice(0, 180)}` : ''}${action.permissions ? `；可见性：${action.permissions}` : ''}`;
+    case 'calendar_container_update': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份修改日历 ${action.calendarId}：${JSON.stringify({ summary: action.summary, description: action.description?.slice(0, 180), permissions: action.permissions })}`;
+    case 'calendar_container_delete': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份删除整个共享日历 ${action.calendarId}（包含其日程），请仔细核对目标`;
+    case 'resource_authorize': return `申请你的${action.resource === 'calendar' ? '日历' : '任务'}用户授权，以继续：${action.summary}\n确认后提供授权链接，请以自己的账号打开；授权不会直接执行新增、修改或删除。`;
+    case 'task_delete': return `删除任务 ${action.taskId}`;
+    case 'task_create': return `创建任务：${action.summary}${action.permissionMode === 'user' ? '（用户身份，负责人为你）' : ''}${action.description ? `；说明：${action.description.slice(0, 180)}` : ''}${action.startTimestamp ? `；开始：北京时间 ${formatShanghaiTime(String(Number(action.startTimestamp) / 1000))}` : ''}${action.dueTimestamp ? `；截止：北京时间 ${formatShanghaiTime(String(Number(action.dueTimestamp) / 1000))}` : ''}`;
+    case 'task_update': return `修改任务 ${action.taskId}：${[action.summary, action.description ? `说明：${action.description.slice(0, 180)}` : undefined, action.startTimestamp ? `开始：北京时间 ${formatShanghaiTime(String(Number(action.startTimestamp) / 1000))}` : undefined, action.dueTimestamp ? `截止：北京时间 ${formatShanghaiTime(String(Number(action.dueTimestamp) / 1000))}` : undefined, action.completedAt === undefined ? undefined : action.completedAt === '0' ? '恢复未完成' : '标记完成'].filter(Boolean).join('；')}`;
     case 'message_send': return `向会话 ${action.targetChatId} 发送：${action.text.slice(0, 180)}`;
     case 'sheet_cell_set': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份修改电子表格 ${action.spreadsheetToken} / ${action.sheetId} 的 ${action.cell}：${JSON.stringify(action.expectedValue)} → ${JSON.stringify(action.value)}`;
     case 'sheet_row_append': return `以${action.permissionMode === 'user' ? '用户' : '应用'}身份在电子表格 ${action.spreadsheetToken} / ${action.sheetId} 追加一行：${JSON.stringify(Object.fromEntries(action.headers.map((header, index) => [header, action.values[index]]))).slice(0, 1200)}`;
@@ -50,6 +62,15 @@ export function actionSummary(action: OfficeAction): string {
 }
 
 export function actionResultDetail(action: OfficeAction, result: unknown): string | undefined {
+  if ((result as { status?: string } | undefined)?.status === 'authorization_required') return '操作尚未执行，已发送新的授权审批卡。完成授权后会继续原请求。';
+  if (action.kind === 'resource_authorize') {
+    const link = (result as { authorizationUrl?: string })?.authorizationUrl;
+    return link ? `请[打开飞书授权页面](${link})完成授权。授权后自动继续原请求，写操作仍需确认。` : '请返回飞书查看授权链接。';
+  }
+  if (action.kind.startsWith('task_') || action.kind.startsWith('calendar_container_') || action.kind === 'calendar_delete') {
+    const data = result as { task?: { guid?: string; url?: string }; calendar?: { calendar_id?: string } } | undefined;
+    return `${actionSummary(action)}${data?.task?.guid ? `\n任务 ID：${data.task.guid}` : ''}${data?.calendar?.calendar_id ? `\n日历 ID：${data.calendar.calendar_id}` : ''}`;
+  }
   if (action.kind === 'drive_file_rename') return `${actionSummary(action)}\n标题已回读确认。`;
   if (action.kind === 'release_materials') {
     const release = result as { folderUrl?: string; files?: Array<{ name: string; url: string }> } | null;

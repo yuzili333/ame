@@ -1,0 +1,17 @@
+Command: npm run build
+Result: exit 0 (final run with network access)
+
+INFO [2026-11-17 14:22:26.354 +0800] (Mastra CLI): Analyzing dependencies...
+INFO [2026-11-17 14:22:28.377 +0800] (Mastra CLI): Optimizing dependencies...
+INFO [2026-11-17 14:22:28.379 +0800] (Mastra CLI): Bundling Mastra application
+INFO [2026-11-17 14:22:30.226 +0800] (Mastra CLI): Bundling Mastra done
+INFO [2026-11-17 14:22:30.226 +0800] (Mastra CLI): Copying public files
+INFO [2026-11-17 14:22:30.230 +0800] (Mastra CLI): Done copying public files
+INFO [2026-11-17 14:22:30.230 +0800] (Mastra CLI): Copying .npmrc file
+INFO [2026-11-17 14:22:30.231 +0800] (Mastra CLI): Done copying .npmrc file
+INFO [2026-11-17 14:22:30.231 +0800] (Mastra CLI): Updating dependency lockfile and installing dependencies
+added 241 packages in 2s
+INFO [2026-11-17 14:22:32.086 +0800] (Mastra CLI): added 241 packages in 2s
+INFO [2026-11-17 14:22:32.100 +0800] (Mastra CLI): Done updating dependency lockfile and installing dependencies
+INFO [2026-11-17 14:22:32.128 +0800] (Mastra CLI): Build successful, you can now deploy the .mastra/output directory to your target platform.
+INFO [2026-11-17 14:22:32.128 +0800] (Mastra CLI): To start the server, run: node .mastra/output/index.mjs

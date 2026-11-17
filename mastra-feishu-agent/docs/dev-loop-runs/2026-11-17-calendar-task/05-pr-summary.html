@@ -1,0 +1,137 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>飞书日历与任务 · 改动报告</title><style>
+body{margin:0;background:#f3f5f7;color:#1b2836;font:16px/1.75 system-ui,sans-serif}main{max-width:1000px;margin:48px auto;padding:0 28px}h1{font-size:32px;line-height:1.3}small{color:#526473}.status{display:inline-block;padding:5px 14px;background:#dff1e9;color:#175d3c;border-radius:20px}section,details{background:white;padding:22px 26px;margin:18px 0;border:1px solid #dde3e8;border-radius:12px}h2{font-size:20px;margin:0 0 10px}summary{cursor:pointer;font-weight:650}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:14px/1.8 system-ui,sans-serif}a{color:#155d9c}li{margin:7px 0}table{border-collapse:collapse;width:100%}td,th{padding:9px 12px;text-align:left;border-bottom:1px solid #e7ebef}</style><main>
+<small>2026-11-17 · Mastra 飞书办公智能体 · 本地改动报告</small><h1>日历与任务操作，授权后继续原请求</h1><p class="status">自动验收通过 · 197 项测试 · 类型检查与构建通过</p>
+<section><h2>交付内容</h2><ul><li>个人/共享日历查询、共享日历增改删，以及日历内日程的完整增删改查。</li><li>请求者任务的查询、新增、编辑、完成/恢复和删除，新建个人任务自动指定请求者为负责人。</li><li>缺少权限时先发授权确认卡，确认后打开 OAuth 链接；回调后继续读取或生成写入确认卡。</li><li>授权打断前置查询时，保存原始请求和消息时间，查询后通过持久化队列继续完成需求。</li></ul></section>
+<section><h2>用户流程</h2><p>发起请求 → 授权确认卡 → 打开授权页面 → 校验账号 → 继续原请求 → 写入确认卡（仅写操作）→ 返回结果</p><p>取消、撤回、过期、重复点击与服务重启均有保护。资源共享权限由所有者管理；授权本身不授予 owner/writer 权限。</p></section>
+<section><h2>验证结果</h2><table><tr><th>检查</th><th>结果</th><th>证据</th></tr><tr><td>Vitest</td><td>20 文件，197/197</td><td><a href="artifacts/test-outputs/tests.log">测试日志</a></td></tr><tr><td>TypeScript</td><td>通过</td><td><a href="artifacts/test-outputs/typecheck.log">类型检查</a></td></tr><tr><td>标准生产构建</td><td>通过</td><td><a href="artifacts/test-outputs/build-final.log">最终构建日志</a></td></tr></table><p>首次沙箱构建在依赖安装时遭网络限制，获准重跑后完整成功。没有修改依赖版本。</p></section>
+<section><h2>部署前仍需核对</h2><p>真实私有化租户尚未联调。按 <a href="../../../README.md">README</a> 配置并发布日历/任务用户权限、OAuth 地址及回调，再使用测试数据验证。个人主日历不能新建/删除；任务列表仅为“我负责的”。未重启网关、提交或部署。</p></section>
+<section><h2>主要文件</h2><p>新增 resource-operation.ts 与 resource-permission.ts，扩展 OfficeApi、审批动作、网关回调与持久化续办队列；通过现有 officeTools 集合注册工具。新增 30 项测试，更新配置说明与 Agent 指令。</p></section>
+<details><summary>需求范围</summary><pre># 日历与任务用户授权
+
+## Goal
+飞书机器人查询、新增、编辑、删除个人/共享日历、日历内日程及用户任务；缺少授权时先请求用户审批，确认后提供 OAuth 链接，回调后继续原操作。
+
+## User-visible Behavior / Acceptance Criteria
+- 日历列表、详情、日程列表/详情及任务列表/详情支持用户身份；明确共享日历支持应用身份。
+- 日历实体和日程分别提供增改删，不能删除个人主日历；任务支持增改删和完成/恢复。
+- 未授权先发卡片，确认才生成链接；只有原请求者、原会话、原卡片可确认。
+- OAuth state 一次性、有时效、绑定请求者；错误账号、拒绝、撤回、重启中断不执行写入。
+- 授权成功恢复保存的具体请求。读取直接返回结果；写入沿用现有操作审批。
+- 明确资源 ACL 不足时说明联系所有者；不隐式借用应用身份，也不重放结果不明的写入。
+
+## Constraints / Assumptions
+沿用 TypeScript、Mastra、SQLite、飞书 SDK 和现有 HTTP 回调。OAuth 链接由用户在飞书客户端打开。资源 ACL 不能通过 OAuth 自动授予。旧审批/旧权限流程兼容，不迁移或重放历史请求。私有化接口仍需租户实测。
+
+## Non-goals
+自动修改共享成员或 ACL、递归日程批量处理、任务清单管理、部署/提交代码。
+
+## Source Request / Repo Context
+用户要求两项 CRUD 与授权续办；已确认同时包含日历实体与日程。main，base_sha 50946b3763528f9a13cf8e9b38aa0769ce2575da，开始时工作区干净。
+
+## Open Questions
+无阻塞问题。
+</pre></details><details><summary>实施计划</summary><pre># Calendar and Task Implementation Plan
+
+**Goal:** 完整 CRUD、授权审批和原请求续办。
+**Architecture:** 新增 resource-operation 服务作为日历/任务统一入口，持久化具体意图；用现有 actions 表承载授权审批，permission_requests 存续办状态。OAuth 回调只恢复已批准且未撤回的请求。保留旧流程以兼容历史记录。
+**Tech Stack:** TypeScript / Zod / Mastra / LibSQL / Feishu OpenAPI.
+**Spec:** 00-requirements.md
+
+## Tasks
+- [x] 1. actions.ts / client.ts：日历实体、日程删除、用户任务 CRUD 和分页；先测试请求身份、路径和参数。
+- [x] 2. resource-operation.ts / resource-permission.ts / user-auth.ts：可信调用者、授权范围、审批 state、一次性回调、读取续办/写审批、取消与恢复；先测试未授权和回调防重放。
+- [x] 3. office-tools.ts / gateway.ts / cards.ts / agent.ts：工具注册与提示、授权卡片链接、回调/撤回/重启集成；测试真实网关审批路径。
+- [x] 4. README / .env.example / workspace skill：配置与能力说明；全量验证、内联验收、HTML 摘要。
+
+## Verification
+`npm test -- src/tests/resource-operation.test.ts src/tests/resource-permission.test.ts`
+`npm run typecheck`、`npm test`、`npm run build`
+
+## Review Focus
+跨用户确认；权限缺失与资源 ACL 区分；回调重复/过期/撤回；刷新 scope 变化；DELETE 网络超时不重放；日历只读角色和主日历保护。
+
+## Execution
+使用 writing-plans / test-driven-development / verification-before-completion；按现有授权范围直接实施。内联多角度评审，不启动子代理，不提交/发布。
+</pre></details><details><summary>计划评审</summary><pre># Plan review
+
+内联从架构、测试、产品、安全四个角度评审。APPROVED。
+
+- 授权与写入分离，复用现有审批身份检查；无需修改审批协议。
+- 明确区分日历实体和日程，拒绝删除个人主日历。
+- 持久化意图，OAuth 不依赖仍存活的 Agent 会话。
+- 已授权但资源 ACL 不足不会反复发起 OAuth；服务重启中的续办不重放。
+- 新流程独立状态前缀，兼容历史日历/表格请求；测试覆盖交叉身份和一次执行。
+- 未获子代理授权，按技能允许的内联评审执行。
+</pre></details><details><summary>实现与验证</summary><pre># Implementation log
+
+## Delivered
+- `resource-operation.ts`：日历实体与日程分开建模；用户任务列表/详情；只读权限、分页、角色检查和主日历保护。Calendar GET 同时支持官方直接返回实体和旧私有化包装格式。
+- `actions.ts` / `client.ts`：日历实体增改删、日程删除、用户任务增改删及完成/恢复；用户令牌必需；个人任务负责人由可信 caller 指定。DELETE 和其他写入均不自动重试。
+- `resource-permission.ts`：授权审批、状态绑定、OAuth 回调续办、过期/取消/撤回、错误账号、范围不足、资源 ACL 错误、重启续办去重。
+- `user-auth.ts`：按需范围与原授权范围合并、刷新后再次核验范围、OAuth 拒绝回调。旧日历流程的过期错误识别保持兼容。
+- 工具集合通过 `src/mastra/index.ts` 的现有 `officeTools` 注册路径暴露全部工具；Agent 指令和 Workspace 日历技能同步更新。
+- Gateway：确认后在原卡片展示授权链接；授权写入仍单独确认。授权打断前置查询时，保存原始自然语言请求与原消息时间，查询完成后进入持久化会话队列继续处理。撤回与取消不能遗留可执行写卡。
+- README / `.env.example`：配置权限、交互示例、日历实体与日程区别、任务列表范围及私有化联调步骤。
+
+## Verification evidence
+新增 `resource-operation.test.ts`（10 项）与 `resource-permission.test.ts`（20 项）。关键缺失行为先见失败后实现，包括用户令牌传递、删除、授权确认、回调防重放、网关链接、任务负责人、刷新后范围缩减、授权中取消、重启不重复发写卡、查找后继续修改请求。旧日期校正测试更新为新的持久化意图结构。
+
+新增测试 30 项；全量 `npm test` 197/197；`npm run typecheck` 和完整 `npm run build` 通过。输出见 `artifacts/test-outputs/`。
+
+## Review fixes
+- 网关写入执行显式传入当前 Gateway 的 API，避免误用 Studio 回退客户端。
+- 使用 SDK 的 `withUserAccessToken` 选项传递用户令牌，测试验证真实选项结构。
+- OAuth 回调中每次远端预检后重新检查取消/撤回状态。
+- 重启发生在“发写卡后、更新 OAuth 状态前”时，续办复用原待确认卡。
+- HTTP 401/403 无业务错误码时归一化为认证/权限错误，保留无授权恢复入口。
+
+## Environment
+未操作真实飞书数据，未重启网关，未提交/推送代码。内联完成需求、测试、安全、兼容性评审，未启动子代理。
+
+最终复核增加旧卡重复点击回归：写入因令牌失效转入授权后，从持久化结果恢复等待授权状态，避免误显示写入成功。
+</pre></details><details><summary>验收矩阵</summary><pre># Acceptance Report
+
+## Verdict
+PASS_WITH_NOTES — 自动验证完成，真实私有化飞书租户尚需联调。
+
+## Scope Checked
+日历实体/日程和任务 CRUD、用户身份、审批与 OAuth 续办、会话队列、取消/撤回、令牌范围、兼容性及配置说明。
+
+## Reviewers Run
+内联需求验收、测试覆盖、代码质量、安全、文档/兼容性评审；未启动子代理。
+
+## Tests Run
+| 命令 | 结果 | 证据 |
+| --- | --- | --- |
+| npm test | 20 个测试文件，197/197 通过 | artifacts/test-outputs/tests.log |
+| npm run typecheck | exit 0 | artifacts/test-outputs/typecheck.log |
+| npm run build | exit 0，Bundling 与产物依赖安装成功 | artifacts/test-outputs/build-final.log |
+| git diff --check | 通过 | 最终工作区检查 |
+
+首次构建的依赖安装被沙箱代理访问限制阻断（EPERM），代码打包已成功；使用获准的网络权限重跑标准构建后完整通过。保留首次日志 build.log 以供区分。
+
+## Requirement Coverage
+| 验收项 | 实现和验证 |
+| --- | --- |
+| 查询个人/共享日历 | 列表/详情、用户主日历解析、用户/应用身份、分页 |
+| 新建/编辑/删除日历实体 | 共享日历创建/删除、全局属性编辑；角色检查与个人主日历保护 |
+| 日程 CRUD | 列表/详情/增改删；时间范围校验与相对日期回归 |
+| 用户任务 CRUD | 用户令牌、负责人绑定、列表/详情、完成/恢复、删除 |
+| 缺权限先审批再链接 | resource_authorize 卡片，未确认时无 OAuth 链接 |
+| OAuth 后继续原需求 | 一次性回调，读取结果续办；前置查询后恢复原消息、调用者与时间；写入单独确认 |
+| 拒绝/错误身份/重复/过期 | 通用审批测试和新授权状态测试；不允许越权执行 |
+| 取消、撤回、服务重启 | 远端预检后复查状态，取消遗留写卡，复用原审批，队列恢复 |
+| 令牌刷新及授权范围 | 增量申请范围；刷新后范围缩水会重新请求授权 |
+| 避免误报成功 | 写前令牌失效转授权后，重复点击旧卡仍显示等待授权 |
+| 不重放不明写入 | DELETE 网络超时仅调用一次；失败或中断操作不能由授权重放 |
+
+## Findings / Fixes Applied
+已解决：网关误用 Studio 回退客户端、令牌刷新后的范围遗漏、预检期间取消未阻断、重启产生重复审批、前置查询授权后只返回数据而未继续原始需求、旧卡重复点击误显示成功。无未解决 BLOCKER/IMPORTANT。
+
+## Residual Risks / Follow-ups
+- 未对真实飞书账号执行增改删或 OAuth；按 README 在目标租户使用测试日历/任务完成联调。
+- 管理员须开通并发布相应用户权限，配置可从用户客户端访问的 OAuth 回调。OAuth 不能替用户取得资源 owner/writer 权限。
+- 按飞书 API 限制，个人主日历不能新建/删除；任务列表仅涵盖“我负责的”，其他已知任务可用 GUID 读取。
+- 网络超时、进程中断后的远端写入结果必须人工核对；不自动重放。
+- 未重启运行中的网关，未提交、推送或部署。
+</pre></details></main></html>

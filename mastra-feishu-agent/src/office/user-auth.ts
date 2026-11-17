@@ -5,6 +5,12 @@ import { stateDb } from '../state/store';
 
 type OAuthResponse = { code?: number | string; msg?: string; access_token?: string; refresh_token?: string; expires_in?: number; scope?: string };
 export const CALENDAR_SCOPES = ['calendar:calendar', 'calendar:calendar:readonly', 'offline_access'];
+export class UserAuthorizationRequiredError extends Error {}
+export async function authorizationScopes(userId: string, requested: string[]): Promise<string[]> {
+  const row = (await (await stateDb()).execute({ sql: 'SELECT scopes FROM user_tokens WHERE user_id = ?', args: [userId] })).rows[0];
+  const current = row?.scopes ? JSON.parse(String(row.scopes)) as string[] : [];
+  return [...new Set([...current, ...requested])];
+}
 const required = () => {
   if (!config.appId || !config.appSecret || !config.domain || !config.oauthAuthorizeUrl || !config.oauthTokenUrl || !config.oauthRedirectUri || !config.tokenEncryptionKey) {
     throw new Error('用户权限尚未配置：需设置 FEISHU_OAUTH_AUTHORIZE_URL、FEISHU_OAUTH_TOKEN_URL、FEISHU_OAUTH_REDIRECT_URI 和 FEISHU_TOKEN_ENCRYPTION_KEY');
@@ -85,12 +91,17 @@ export async function invalidateUserAccessToken(userId: string, expectedToken: s
 }
 
 const refreshing = new Map<string, Promise<string>>();
+function hasScopes(granted: string[], required: string[]) {
+  return required.filter(scope => scope !== 'offline_access').every(scope => granted.includes(scope)
+    || (scope === 'task:task:read' && granted.includes('task:task:write'))
+    || (scope === 'calendar:calendar:readonly' && granted.includes('calendar:calendar')));
+}
 export async function userAccessToken(userId: string, requiredScopes: string[] = []): Promise<string | null> {
   const db = await stateDb();
   const row = (await db.execute({ sql: 'SELECT * FROM user_tokens WHERE user_id = ?', args: [userId] })).rows[0];
   if (!row) return null;
   const scopes = row.scopes ? JSON.parse(String(row.scopes)) as string[] : CALENDAR_SCOPES;
-  if (!requiredScopes.filter(scope => scope !== 'offline_access').every(scope => scopes.includes(scope))) return null;
+  if (!hasScopes(scopes, requiredScopes)) return null;
   if (Number(row.expires_at) > Date.now() + 60_000) return decrypt(String(row.encrypted_token));
   if (!row.encrypted_refresh_token) return null;
   let pending = refreshing.get(userId);
@@ -107,15 +118,20 @@ export async function userAccessToken(userId: string, requiredScopes: string[] =
           return decrypt(String(current.encrypted_token));
         }
         await db.execute({ sql: 'DELETE FROM user_tokens WHERE user_id = ? AND encrypted_token = ?', args: [userId, String(row.encrypted_token)] });
-        throw new Error('用户日历授权已过期，请重新授权');
+        throw new UserAuthorizationRequiredError('用户授权已过期，请重新授权');
       }
     })().finally(() => refreshing.delete(userId));
     refreshing.set(userId, pending);
   }
-  return pending;
+  await pending;
+  // A refresh may narrow scopes, and parallel callers can require different
+  // scopes. Validate the saved grant again rather than trusting the old row.
+  const current = (await db.execute({ sql: 'SELECT encrypted_token, scopes FROM user_tokens WHERE user_id=?', args: [userId] })).rows[0];
+  if (!current || !hasScopes(current.scopes ? JSON.parse(String(current.scopes)) as string[] : [], requiredScopes)) return null;
+  return decrypt(String(current.encrypted_token));
 }
 
-export async function startOAuthCallback(onAuthorized: (state: string, code: string) => Promise<void>): Promise<Server | undefined> {
+export async function startOAuthCallback(onAuthorized: (state: string, code: string) => Promise<void>, onDenied?: (state: string) => Promise<void>): Promise<Server | undefined> {
   if (!config.oauthRedirectUri) return undefined;
   const redirect = new URL(config.oauthRedirectUri);
   const server = createServer((request, response) => {
@@ -124,8 +140,9 @@ export async function startOAuthCallback(onAuthorized: (state: string, code: str
       if (request.method !== 'GET' || url.pathname !== redirect.pathname) { response.writeHead(404).end(); return; }
       const state = url.searchParams.get('state');
       const code = url.searchParams.get('code');
-      if (!state || !code || url.searchParams.has('error')) { response.writeHead(400).end('授权已取消或参数不完整'); return; }
       try {
+        if (state && url.searchParams.has('error')) await onDenied?.(state);
+        if (!state || !code || url.searchParams.has('error')) { response.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }).end('授权已取消或参数不完整'); return; }
         await onAuthorized(state, code);
         response.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' }).end('飞书用户授权成功，请返回飞书查看后续操作。');
       } catch (error) {

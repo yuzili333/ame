@@ -141,6 +141,7 @@ export async function markMessageSeen(messageId: string): Promise<boolean> {
 
 export async function recoverInterruptedApprovals(): Promise<number> {
   const db = await stateDb();
+  await db.execute("UPDATE permission_requests SET status='resource_failed' WHERE status='resource_auth_processing'");
   const result = await db.execute({
     sql: "UPDATE actions SET status = 'interrupted' WHERE status = 'executing' OR (status = 'pending' AND kind = 'mastra_tool')",
     args: [],

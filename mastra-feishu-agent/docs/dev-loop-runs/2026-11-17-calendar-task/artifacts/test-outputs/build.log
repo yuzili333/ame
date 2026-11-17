@@ -1,0 +1,71 @@
+
+> mastra-feishu-agent@1.0.0 build
+> node --env-file=.env ./scripts/mastra-cli.mjs build
+
+[32mINFO[39m [2026-11-17 14:18:41.308 +0800] (Mastra CLI): [36mAnalyzing dependencies...[39m
+[32mINFO[39m [2026-11-17 14:18:44.501 +0800] (Mastra CLI): [36mOptimizing dependencies...[39m
+[32mINFO[39m [2026-11-17 14:18:44.503 +0800] (Mastra CLI): [36mBundling Mastra application[39m
+[32mINFO[39m [2026-11-17 14:18:46.328 +0800] (Mastra CLI): [36mBundling Mastra done[39m
+[32mINFO[39m [2026-11-17 14:18:46.328 +0800] (Mastra CLI): [36mCopying public files[39m
+[32mINFO[39m [2026-11-17 14:18:46.333 +0800] (Mastra CLI): [36mDone copying public files[39m
+[32mINFO[39m [2026-11-17 14:18:46.333 +0800] (Mastra CLI): [36mCopying .npmrc file[39m
+[32mINFO[39m [2026-11-17 14:18:46.333 +0800] (Mastra CLI): [36mDone copying .npmrc file[39m
+[32mINFO[39m [2026-11-17 14:18:46.333 +0800] (Mastra CLI): [36mUpdating dependency lockfile and installing dependencies[39m
+npm error code EPERM
+[32mINFO[39m [2026-11-17 14:21:06.698 +0800] (Mastra CLI): [36mnpm error code EPERM[39m
+npm error syscall connect
+npm error errno EPERM
+[32mINFO[39m [2026-11-17 14:21:06.698 +0800] (Mastra CLI): [36mnpm error syscall connect
+npm error errno EPERM[39m
+npm error FetchError: request to https://registry.npmjs.org/@modelcontextprotocol%2fclient failed, reason: connect EPERM 127.0.0.1:7897 - Local (0.0.0.0:0)
+npm error     at ClientRequest.<anonymous> (/usr/local/lib/node_modules/npm/node_modules/minipass-fetch/lib/index.js:130:14)
+npm error     at ClientRequest.emit (node:events:508:28)
+npm error     at emitErrorEvent (node:_http_client:108:11)
+npm error     at _destroy (node:_http_client:962:9)
+npm error     at onSocketNT (node:_http_client:982:5)
+npm error     at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+npm error   code: 'EPERM',
+npm error   errno: 'EPERM',
+npm error   syscall: 'connect',
+npm error   address: '127.0.0.1',
+npm error   port: 7897,
+npm error   type: 'system',
+npm error   requiredBy: 'node_modules/@mastra/mcp'
+npm error }
+[32mINFO[39m [2026-11-17 14:21:06.699 +0800] (Mastra CLI): [36mnpm error FetchError: request to https://registry.npmjs.org/@modelcontextprotocol%2fclient failed, reason: connect EPERM 127.0.0.1:7897 - Local (0.0.0.0:0)
+npm error     at ClientRequest.<anonymous> (/usr/local/lib/node_modules/npm/node_modules/minipass-fetch/lib/index.js:130:14)
+npm error     at ClientRequest.emit (node:events:508:28)
+npm error     at emitErrorEvent (node:_http_client:108:11)
+npm error     at _destroy (node:_http_client:962:9)
+npm error     at onSocketNT (node:_http_client:982:5)
+npm error     at process.processTicksAndRejections (node:internal/process/task_queues:90:21) {
+npm error   code: 'EPERM',
+npm error   errno: 'EPERM',
+npm error   syscall: 'connect',
+npm error   address: '127.0.0.1',
+npm error   port: 7897,
+npm error   type: 'system',
+npm error   requiredBy: 'node_modules/@mastra/mcp'
+npm error }[39m
+npm error
+npm error The operation was rejected by your operating system.
+npm error It is likely you do not have the permissions to access this file as the current user
+npm error
+npm error If you believe this might be a permissions issue, please double-check the
+npm error permissions of the file and its containing directories, or try running
+npm error the command again as root/Administrator.
+[32mINFO[39m [2026-11-17 14:21:06.699 +0800] (Mastra CLI): [36mnpm error
+npm error The operation was rejected by your operating system.
+npm error It is likely you do not have the permissions to access this file as the current user
+npm error
+npm error If you believe this might be a permissions issue, please double-check the
+npm error permissions of the file and its containing directories, or try running
+npm error the command again as root/Administrator.[39m
+npm error Log files were not written due to an error writing to the directory: /Users/yuzili/.npm/_logs
+npm error You can rerun the command with `--loglevel=verbose` to see the logs in your terminal
+[32mINFO[39m [2026-11-17 14:21:06.701 +0800] (Mastra CLI): [36mnpm error Log files were not written due to an error writing to the directory: /Users/yuzili/.npm/_logs
+npm error You can rerun the command with `--loglevel=verbose` to see the logs in your terminal[39m
+[31mERROR[39m [2026-11-17 14:21:06.712 +0800] (Mastra CLI): [36mFailed during bundler bundle stage: Process exited with code 1[39m
+    [35mdomain[39m: "DEPLOYER"
+    [35mcategory[39m: "SYSTEM"
+    [35mdetails[39m: {}
