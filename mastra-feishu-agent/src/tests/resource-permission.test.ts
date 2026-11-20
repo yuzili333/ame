@@ -373,3 +373,214 @@ it('repairs a legacy pending intent from its saved source before presenting the 
     startTimestamp: String(Date.parse('2026-11-17T16:00:00+08:00')), dueTimestamp: String(Date.parse('2026-11-17T17:00:00+08:00')),
   });
 });
+
+it('resumes colleague search after OAuth and approves attendee creation exactly once', async () => {
+  const resumed: unknown[] = [];
+  permission.setResourceContinuation(async (...args) => { resumed.push(args); });
+  const source = { originalMessage: '把张三加入刚创建的日程', messageCreatedAt: Date.now() };
+  await permission.requestResourceOperation(caller, { kind: 'openapi_read', operationId: 'contact.user.search', permissionMode: 'user', scopes: [], summary: '搜索张三', arguments: { params: { query: '张三' } } }, source);
+  expect(requests).toHaveLength(0);
+  await permission.completeResourceAuthorization(await consent(), 'code');
+  expect(requests[0]).toMatchObject({ method: 'GET', url: '/open-apis/search/v1/user', params: { query: '张三' }, userAccessToken: 'user-token' });
+  expect(resumed[0]).toMatchObject([caller, source, expect.any(Object), expect.any(String)]);
+  await auth.exchangeCodeForUser('code', 'u1', ['contact:user:search', 'calendar:calendar']);
+  await permission.requestResourceOperation(caller, { kind: 'openapi_write', operationId: 'calendar.v4.calendar.event.attendee.create', permissionMode: 'user', scopes: [], summary: '邀请选定同事张三', arguments: {
+    path: { calendar_id: 'cal', event_id: 'event1' }, params: { user_id_type: 'open_id' }, data: { attendees: [{ type: 'user', user_id: 'ou_zhangsan' }] },
+  } }, source);
+  expect(requests).toHaveLength(1);
+  const id = cards.at(-1)!;
+  const execute = (action: import('../office/actions').OfficeAction, key: string) => {
+    if (action.kind !== 'openapi_write') throw new Error('Expected API write');
+    return permission.executeResourceWrite(caller, action, key);
+  };
+  await approvals.decideAction(id, caller, true, execute);
+  await approvals.decideAction(id, caller, true, execute);
+  expect(requests).toHaveLength(2);
+  expect(requests[1]).toMatchObject({ method: 'POST', url: '/open-apis/calendar/v4/calendars/cal/events/event1/attendees', userAccessToken: 'user-token', data: { attendees: [{ type: 'user', user_id: 'ou_zhangsan' }] } });
+});
+
+it('uses application grants for directory reads and does not replace an app denial with user OAuth', async () => {
+  const input = { kind: 'openapi_read' as const, operationId: 'contact.v3.user.get', permissionMode: 'app' as const, scopes: [], summary: '查询用户', arguments: { path: { user_id: 'ou1' }, params: { user_id_type: 'open_id' } } };
+  await permission.requestResourceOperation(caller, input);
+  expect(requests[0]).toMatchObject({ method: 'GET', url: '/open-apis/contact/v3/users/ou1', userAccessToken: undefined });
+  expect(cards).toHaveLength(0);
+  responseCode = 99991672;
+  await expect(permission.requestResourceOperation(caller, input)).rejects.toThrow('管理员');
+  expect(cards).toHaveLength(0);
+});
+
+it('rejects a generic write disguised as a read before authorization or API access', async () => {
+  await expect(permission.requestResourceOperation(caller, { kind: 'openapi_read', operationId: 'calendar.v4.calendar.event.attendee.create', permissionMode: 'user', scopes: [], summary: 'Read?', arguments: { path: { calendar_id: 'cal', event_id: 'evt' } } })).rejects.toThrow('读写类型');
+  expect(cards).toHaveLength(0);
+  expect(requests).toHaveLength(0);
+});
+
+it('corrects calendar clocks before OAuth and preserves them through the write approval', async () => {
+  const ms = (clock: string) => Date.parse(`2026-11-18T${clock}:00+08:00`);
+  await permission.requestResourceOperation(caller, { kind: 'calendar_create', calendarId: 'cal', summary: '时间核对', startTime: String(ms('21:40') / 1000), endTime: String(ms('22:40') / 1000) }, { originalMessage: '创建今天11:00-12:00的日程', messageCreatedAt: ms('10:00') });
+  await permission.completeResourceAuthorization(await consent(), 'code');
+  const write = JSON.parse((await store.getAction(cards[1]))!.payload);
+  expect(write).toMatchObject({ startTime: String(ms('11:00') / 1000), endTime: String(ms('12:00') / 1000) });
+  await approvals.decideAction(cards[1], caller, true, (action, key) => permission.executeResourceWrite(caller, action as never, key));
+  expect(requests.at(-1)).toMatchObject({ method: 'POST', data: { start_time: { timestamp: String(ms('11:00') / 1000) }, end_time: { timestamp: String(ms('12:00') / 1000) } } });
+});
+
+it('returns current capabilities and isolates recently created events by requester and chat', async () => {
+  const { officeTools } = await import('../mastra/tools/office-tools');
+  const context = { requestContext: { get: (key: string) => key === 'caller' ? caller : undefined } };
+  const invoke = (name: keyof typeof officeTools) => (Reflect.get(officeTools[name], 'execute') as (input: unknown, context: unknown) => Promise<Record<string, unknown>>)({}, context);
+  const capabilities = JSON.stringify(await invoke('capabilitiesTool'));
+  expect(capabilities).toContain('updateCalendarTool');
+  expect(capabilities).toContain('群聊消息');
+  expect(capabilities).toContain('office_call_api');
+  expect(capabilities).toContain('start_schedule');
+  await auth.exchangeCodeForUser('code', 'u1', ['calendar:calendar']);
+  await permission.requestResourceOperation(caller, { kind: 'calendar_create', calendarId: 'cal', summary: 'My event', startTime: '1794970800', endTime: '1794974400' });
+  await approvals.decideAction(cards[0], caller, true, async () => ({ event: { event_id: 'evt_real' } }));
+  expect(await invoke('recentCalendarEventsTool')).toMatchObject({ events: [{ calendarId: 'cal', eventId: 'evt_real' }] });
+  await (await store.stateDb()).execute({ sql: 'UPDATE actions SET requester_id=? WHERE id=?', args: ['someone_else', cards[0]] });
+  expect(await invoke('recentCalendarEventsTool')).toEqual({ events: [] });
+});
+
+it('uses actual missing scopes to request incremental authorization without repeating an identical grant', async () => {
+  const { OfficeApi } = await import('../office/client');
+  bridge.setOfficeApi(new OfficeApi({ request: async () => ({ code: 99991672, msg: 'Required scope: contact:user.base:readonly' }), send: async () => undefined }));
+  await auth.exchangeCodeForUser('code', 'u1', ['offline_access']);
+  const intent = { kind: 'openapi_read' as const, operationId: 'contact.v3.user.get', permissionMode: 'user' as const, scopes: [], summary: '查询用户', arguments: { path: { user_id: 'ou1' } } };
+  const outcome = await permission.requestResourceOperation(caller, intent);
+  expect(outcome.status).toBe('authorization_required');
+  const row = (await (await store.stateDb()).execute('SELECT payload FROM permission_requests')).rows[0];
+  expect(JSON.parse(String(row.payload)).intent.scopes).toEqual(['contact:user.base:readonly']);
+  await auth.exchangeCodeForUser('code', 'u1', ['contact:user.base:readonly']);
+  await expect(permission.requestResourceOperation(caller, { ...intent, scopes: ['contact:user.base:readonly'] })).rejects.toThrow('不会重复');
+  expect(cards).toHaveLength(1);
+});
+
+it('continues a read OAuth flow with a newly discovered scope while preserving the original request', async () => {
+  const { OfficeApi } = await import('../office/client');
+  bridge.setOfficeApi(new OfficeApi({ request: async () => ({ code: 99991672, msg: 'Required scope: contact:user.base:readonly' }), send: async () => undefined }));
+  const source = { originalMessage: '查询同事', messageCreatedAt: Date.now() };
+  await permission.requestResourceOperation(caller, { kind: 'openapi_read', operationId: 'contact.v3.user.get', permissionMode: 'user', scopes: [], summary: '查询用户', arguments: { path: { user_id: 'ou1' } } }, source);
+  await permission.completeResourceAuthorization(await consent(), 'code');
+  const rows = (await (await store.stateDb()).execute("SELECT payload FROM permission_requests WHERE status='resource_approval'")).rows;
+  expect(rows).toHaveLength(1);
+  expect(JSON.parse(String(rows[0].payload))).toMatchObject({ intent: { scopes: ['contact:user.base:readonly'] }, continuation: source });
+});
+
+async function unified(operationId: string, args: Record<string, unknown>) {
+  const { callFeishuApiTool } = await import('../mastra/tools/office-tools');
+  const execute = Reflect.get(callFeishuApiTool, 'execute') as (input: unknown, context: unknown) => Promise<unknown>;
+  return execute({ operationId, arguments: args }, { requestContext: { get: (key: string) => key === 'caller' ? caller : undefined } });
+}
+
+it('corrects the reported January date at the unified boundary before approval and the actual calendar write', async () => {
+  const { callFeishuApiTool } = await import('../mastra/tools/office-tools');
+  const { RequestContext } = await import('@mastra/core/request-context');
+  await auth.exchangeCodeForUser('code', 'u1', ['calendar:calendar']);
+  const requestContext = new RequestContext();
+  requestContext.set('caller', caller);
+  requestContext.set('originalMessage', '创建一个日程，主题是xxx，时间为今天18:00-19:00');
+  requestContext.set('messageCreatedAt', Date.parse('2026-11-20T10:00:00+08:00'));
+  const execute = Reflect.get(callFeishuApiTool, 'execute') as (input: unknown, context: unknown) => Promise<unknown>;
+  await execute({ operationId: 'office_calendar_create', arguments: { calendarId: 'cal', summary: 'xxx', permissionMode: 'user',
+    startTime: String(Date.parse('2027-01-15T11:20:00+08:00') / 1000), endTime: String(Date.parse('2027-01-15T12:20:00+08:00') / 1000) } }, { requestContext });
+  expect(cards).toHaveLength(1);
+  expect(JSON.parse((await store.getAction(cards[0]))!.payload)).toMatchObject({ startTime: '1795168800', endTime: '1795172400' });
+  expect(requests.every(request => request.method === 'GET')).toBe(true);
+  await approvals.decideAction(cards[0], caller, true, (action, key) => permission.executeResourceWrite(caller, action as never, key));
+  expect(requests.at(-1)).toMatchObject({ method: 'POST', data: { start_time: { timestamp: '1795168800' }, end_time: { timestamp: '1795172400' } } });
+});
+
+it.each([
+  ['office_calendar_create', { calendarId: 'cal', summary: 'New', startTime: '1794970800', endTime: '1794974400', permissionMode: 'app' }, 'calendar_create'],
+  ['office_calendar_update', { calendarId: 'cal', eventId: 'evt', summary: 'Updated', permissionMode: 'app' }, 'calendar_update'],
+  ['office_task_create', { summary: 'New', permissionMode: 'app' }, 'task_create'],
+  ['office_task_update', { taskId: 'task1', summary: 'Updated', permissionMode: 'app' }, 'task_update'],
+  ['office_doc_create', { title: 'Doc', content: 'Text' }, 'doc_create'],
+  ['office_doc_update', { documentId: 'doxcn123', blockId: 'block', text: 'Text' }, 'doc_update'],
+  ['office_drive_create_folder', { parentFolderUrl: 'https://api.test/drive/folder/folder1', name: 'Child' }, 'drive_folder_create'],
+  ['office_drive_copy_file', { fileToken: 'doxcn123', fileType: 'docx', name: 'Copy', destinationFolderUrl: 'https://api.test/drive/folder/folder1' }, 'drive_file_copy'],
+  ['office_drive_file_rename', { fileToken: 'doxcn123', fileType: 'docx', folderToken: 'folder1', expectedName: 'Old', newName: 'New' }, 'drive_file_rename'],
+  ['office_message_send', { targetChatId: 'dm1', text: 'Hello' }, 'message_send'],
+])('routes existing business operation %s through its original approval implementation', async (operationId, args, kind) => {
+  const result = await unified(operationId as string, args as Record<string, unknown>);
+  expect(result).toMatchObject({ status: 'pending' });
+  expect(cards).toHaveLength(1);
+  const row = await store.getAction(cards[0]);
+  expect(row?.kind).toBe(kind);
+  expect(requests.every(request => request.method === 'GET')).toBe(true);
+});
+
+it('exposes every business operation schema through discovery and removes duplicate model tools', async () => {
+  const { officeBusinessTools, discoverOfficeOperations } = await import('../mastra/tools/office-tools');
+  for (const tool of Object.values(officeBusinessTools)) {
+    expect(discoverOfficeOperations('', tool.id)).toMatchObject({ operation: { id: tool.id, input: { type: 'object' }, kind: 'business' } });
+  }
+  const { agent } = await import('../mastra/agents/agent');
+  const tools = await agent.listTools();
+  expect(tools).toHaveProperty('office_call_api');
+  expect(tools).toHaveProperty('office_discover_apis');
+  for (const name of Object.keys(officeBusinessTools)) expect(tools).not.toHaveProperty(name);
+  expect(JSON.stringify(discoverOfficeOperations('表格'))).toContain('office_table_');
+  expect(discoverOfficeOperations('创建任务').operations).toContainEqual(expect.objectContaining({ id: 'office_task_create', kind: 'business' }));
+});
+
+it('preserves table preflight through the unified entry and checks changed cells before writing', async () => {
+  const { OfficeApi } = await import('../office/client');
+  let value = 'Old';
+  bridge.setOfficeApi(new OfficeApi({ request: async request => {
+    requests.push(request);
+    if (request.url.endsWith('/members/auth')) return { code: 0, data: { auth_result: true } };
+    if (request.url.endsWith('/sheets/query')) return { code: 0, data: { sheets: [{ sheet_id: 'sheet1', title: 'Sheet' }] } };
+    if (request.url.includes('/values/')) return { code: 0, data: { valueRange: { values: [[value]] } } };
+    return { code: 0, data: {} };
+  }, send: async () => undefined }));
+  expect(await unified('office_table_inspect', { url: 'https://api.test/sheets/token1', permissionMode: 'app' })).toMatchObject({ status: 'read' });
+  const result = await unified('office_table_update_cell', { url: 'https://api.test/sheets/token1', cell: 'A2', value: 'New', permissionMode: 'app' });
+  expect(result).toMatchObject({ status: 'pending' });
+  const row = await store.getAction(cards[0]);
+  expect(JSON.parse(row!.payload)).toMatchObject({ kind: 'sheet_cell_set', expectedValue: 'Old', value: 'New' });
+  value = 'Changed after approval';
+  const outcome = await approvals.decideAction(cards[0], caller, true, (action, key) => bridge.getOfficeApi().execute(action, key));
+  expect(outcome.status).toBe('failed');
+  expect(requests.every(request => request.method === 'GET')).toBe(true);
+});
+
+it('preserves the target-chat allowlist when a message is sent through the unified entry', async () => {
+  const { OfficeApi } = await import('../office/client');
+  const send = vi.fn();
+  bridge.setOfficeApi(new OfficeApi({ request: async () => ({ code: 0, data: {} }), send }));
+  await unified('office_message_send', { targetChatId: 'not-allowlisted', text: 'Hello' });
+  const outcome = await approvals.decideAction(cards[0], caller, true, (action, key) => bridge.getOfficeApi().execute(action, key));
+  expect(outcome.status).toBe('failed');
+  expect(send).not.toHaveBeenCalled();
+  await expect(unified('im.v1.message.create', { params: { receive_id_type: 'chat_id' }, data: { receive_id: 'not-allowlisted', msg_type: 'text', content: '{}' } })).rejects.toThrow();
+});
+
+it('reads documents, tasks, calendar events and folders through the same business dispatcher', async () => {
+  const { OfficeApi } = await import('../office/client');
+  bridge.setOfficeApi(new OfficeApi({ request: async request => { requests.push(request); return { code: 0, data: { files: [], items: [], has_more: false, calendar: { calendar_id: 'cal', role: 'owner' } } }; }, send: async () => undefined }));
+  await auth.exchangeCodeForUser('code', 'u1', ['calendar:calendar:readonly', 'task:task:read']);
+  await unified('office_read_document', { documentId: 'doxcn123' });
+  await unified('office_read_task', { taskId: 'task1' });
+  await unified('office_read_calendar', { calendarId: 'cal', startTime: '1794970800', endTime: '1794974400' });
+  await unified('office_drive_list_folder', { folderUrl: 'https://api.test/drive/folder/folder1' });
+  expect(requests.map(request => request.url)).toEqual(['/open-apis/docx/v1/documents/doxcn123/raw_content', '/open-apis/task/v2/tasks/task1', '/open-apis/calendar/v4/calendars/cal/events', '/open-apis/drive/v1/files']);
+  expect(cards).toHaveLength(0);
+});
+
+it('preserves Bitable field preflight through the unified entry', async () => {
+  const { OfficeApi } = await import('../office/client');
+  bridge.setOfficeApi(new OfficeApi({ request: async request => {
+    requests.push(request);
+    if (request.url.endsWith('/members/auth')) return { code: 0, data: { auth_result: true } };
+    if (request.url.endsWith('/tables')) return { code: 0, data: { items: [{ table_id: 'tbl1', name: 'Table' }] } };
+    if (request.url.endsWith('/fields')) return { code: 0, data: { items: [{ field_name: 'Title', type: 1 }] } };
+    return { code: 0, data: {} };
+  }, send: async () => undefined }));
+  await expect(unified('office_table_create_record', { url: 'https://api.test/base/base1', fields: { Unknown: 'x' }, permissionMode: 'app' })).rejects.toThrow();
+  expect(cards).toHaveLength(0);
+  expect(await unified('office_table_create_record', { url: 'https://api.test/base/base1', fields: { Title: 'x' }, permissionMode: 'app' })).toMatchObject({ status: 'pending' });
+  expect((await store.getAction(cards[0]))?.kind).toBe('bitable_record_create');
+  expect(requests.every(request => request.method === 'GET')).toBe(true);
+});

@@ -6,6 +6,31 @@ import { z } from 'zod';
 import { normalizeProxyModelName } from '../model-url';
 
 describe('OpenAI-compatible model proxy contract', () => {
+  it('sends mandatory discovery to the model proxy and makes the task schema available on the next step', async () => {
+    const { agent: officeAgent } = await import('../mastra/agents/agent');
+    const { agentOfficeTools } = await import('../mastra/tools/office-tools');
+    const { RequestContext } = await import('@mastra/core/request-context');
+    const requestContext = new RequestContext();
+    requestContext.set('originalMessage', '创建一个任务，主题是xxx，时间为今天18:00-19:00');
+    const bodies: Array<Record<string, any>> = [];
+    const provider = createOpenAICompatible({ name: 'catalog-test', baseURL: 'https://proxy.test/v1', fetch: async (_url, options) => {
+      bodies.push(JSON.parse(String(options?.body)));
+      const first = bodies.length === 1;
+      const message = first
+        ? { role: 'assistant', content: null, tool_calls: [{ id: 'discover', type: 'function', function: { name: 'office_discover_apis', arguments: '{"operationId":"office_task_create"}' } }] }
+        : { role: 'assistant', content: '已检索任务创建参数。' };
+      return new Response(JSON.stringify({ id: `r${bodies.length}`, object: 'chat.completion', created: 1, model: 'test', choices: [{ index: 0, message, finish_reason: first ? 'tool_calls' : 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }), { headers: { 'content-type': 'application/json' } });
+    } });
+    const agent = new Agent({ id: 'catalog-proxy-test', name: 'Catalog test', instructions: await officeAgent.getInstructions({ requestContext }),
+      model: provider.chatModel('test'), tools: agentOfficeTools, defaultOptions: await officeAgent.getDefaultOptions({ requestContext }) });
+    await agent.generate('创建一个任务，主题是xxx，时间为今天18:00-19:00');
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0].tool_choice).toEqual({ type: 'function', function: { name: 'office_discover_apis' } });
+    expect(bodies[0].tools.some((tool: any) => tool.function.name === 'office_call_api')).toBe(true);
+    expect(JSON.stringify(bodies[1].messages)).toContain('office_task_create');
+    expect(JSON.stringify(bodies[1].messages)).toContain('startTimestamp');
+    expect(bodies[1].tool_choice).not.toEqual(bodies[0].tool_choice);
+  });
   it('accepts a mocked tool_calls response and executes a typed tool', async () => {
     let calls = 0;
     let toolsCalled = 0;

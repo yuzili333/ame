@@ -7,13 +7,14 @@ import { getOfficeApi } from '../../runtime/office-bridge';
 import { requestOfficeApproval } from '../../runtime/approval-bridge';
 import { requestResourceOperation } from '../../office/resource-permission';
 import { isResourceWrite, resourceRead, type ResourceRead } from '../../office/resource-operation';
-import { reconcileRelativeCalendarDate } from '../../office/calendar-time';
 import { tableIntent, type TableIntent } from '../../office/table-service';
 import { TableService } from '../../office/table-service';
 import { requestTableOperation } from '../../office/table-permission';
 import { ReleaseMaterialsService, parseDriveFolderUrl, releaseInput } from '../../office/release-materials';
 import { sendOfficeText } from '../../runtime/office-bridge';
 import { isMessageRecalled, stateDb } from '../../state/store';
+import { isAuthorizedCaller } from '../../identity';
+import { discoverApis, openApiInput, prepareApiRequest } from '../../office/openapi';
 
 const token = z.string().min(1).max(256).regex(/^[\w@.-]+$/);
 
@@ -36,16 +37,9 @@ function actionTool<T extends OfficeAction['kind']>(kind: T, description: string
     inputSchema: (schema as z.ZodObject<z.ZodRawShape>).omit({ kind: true }),
     execute: async (input, context) => {
       const caller = callerFrom(context);
-      let action = { ...input, kind } as OfficeAction;
+      const action = { ...input, kind } as OfficeAction;
       if (action.kind === 'doc_update' && !action.documentId.startsWith('doxcn')) {
         throw new Error('修改新版文档需要真实的 doxcn documentId；Wiki 节点或表格 token 不能用于 Docx API');
-      }
-      if (action.kind === 'calendar_create') {
-        const originalMessage = context.requestContext.get('originalMessage');
-        const messageCreatedAt = context.requestContext.get('messageCreatedAt');
-        if (typeof originalMessage === 'string' && typeof messageCreatedAt === 'number') {
-          action = reconcileRelativeCalendarDate(action, originalMessage, messageCreatedAt);
-        }
       }
       if (isResourceWrite(action)) return requestResourceOperation(caller, action, continuationFrom(context));
       return requestOfficeApproval(caller, action);
@@ -192,7 +186,80 @@ export async function requestReleaseMaterials(input: z.infer<typeof releaseInput
     }
 }
 
-export const officeTools = {
+export const discoverFeishuApisTool = createTool({
+  id: 'office_discover_apis',
+  description: 'Search the installed official Feishu API catalog by short Chinese or English keywords (e.g. 搜索用户, 参与人, contact, calendar). Then supply operationId to read its complete parameter schema and documentation. Do this before claiming an API capability is unavailable. The catalog is not a statement of granted permissions.',
+  inputSchema: z.object({ query: z.string().max(200).default(''), operationId: z.string().optional(), offset: z.number().int().min(0).default(0) }),
+  execute: async ({ query, operationId, offset }, context) => {
+    const result = discoverOfficeOperations(query, operationId, offset);
+    context.requestContext.set('officeCatalogDiscovered', true);
+    return result;
+  },
+});
+
+export const callFeishuApiTool = createTool({
+  id: 'office_call_api',
+  description: 'Unified entry for ALL office operations: calendars, tasks, documents, Sheets, Bitable, Drive folders/files and sending group messages. Discover an operation and its schema first. For office_* business operationIds, arguments are that operation input (e.g. summary/startTime/endTime), and existing validation, permissions and approval are reused. For other API IDs, arguments are {path,params,data}; supply permissionMode, scopes and summary. Honor managedOperationId instead of bypassing business checks. Stop on pending/authorization_required/permission_choice_required. No arbitrary URLs, headers or credentials for raw APIs.',
+  inputSchema: z.object({ operationId: z.string().min(1).max(300), arguments: z.record(z.string(), z.unknown()), permissionMode: z.enum(['app', 'user']).optional(), scopes: openApiInput.shape.scopes.optional(), summary: z.string().max(1200).optional() }),
+  execute: async (input, context) => {
+    const caller = callerFrom(context);
+    if (!isAuthorizedCaller(caller) || await isMessageRecalled(caller.messageId)) throw new Error('当前请求不可用');
+    const business = businessOperations.get(input.operationId);
+    if (business) {
+      const args = { ...input.arguments };
+      if (input.permissionMode) {
+        if (!('permissionMode' in business.schema.shape)) {
+          throw new Error('该业务操作的身份由原流程决定，请按操作 schema 填写 arguments，不传外层 permissionMode');
+        } else {
+          if (args.permissionMode && args.permissionMode !== input.permissionMode) throw new Error('调用身份与业务参数冲突');
+          args.permissionMode = input.permissionMode;
+        }
+      }
+      return business.execute(business.schema.strict().parse(args), context);
+    }
+    const raw = openApiInput.parse(input);
+    const request = prepareApiRequest(raw);
+    return requestResourceOperation(caller, { ...raw, kind: request.method === 'GET' ? 'openapi_read' : 'openapi_write' }, continuationFrom(context));
+  },
+});
+
+export const recentCalendarEventsTool = createTool({
+  id: 'office_recent_calendar_events',
+  description: 'Find up to five successfully created calendar events in this chat by the current requester. Use for 刚创建的日程 before editing or inviting colleagues. Returns verified calendar/event IDs and times from execution records; do not invent IDs. Multiple possible targets require clarification.',
+  inputSchema: z.object({}),
+  execute: async (_input, context) => {
+    const caller = callerFrom(context);
+    if (!isAuthorizedCaller(caller) || await isMessageRecalled(caller.messageId)) throw new Error('当前请求不可用');
+    const rows = (await (await stateDb()).execute({ sql: "SELECT payload,result,created_at FROM actions WHERE requester_id=? AND chat_id=? AND kind='calendar_create' AND status='succeeded' ORDER BY created_at DESC,rowid DESC LIMIT 5", args: [caller.userId, caller.chatId] })).rows;
+    return { events: rows.flatMap(row => {
+      try {
+        const action = JSON.parse(String(row.payload));
+        const result = JSON.parse(String(row.result));
+        if (!result?.event?.event_id || !action.calendarId) return [];
+        return [{ calendarId: action.calendarId, eventId: result.event.event_id, summary: action.summary, startTime: result.event.start_time?.timestamp ?? action.startTime, endTime: result.event.end_time?.timestamp ?? action.endTime, createdAt: Number(row.created_at) }];
+      } catch { return []; }
+    }) };
+  },
+});
+
+export const capabilitiesTool = createTool({
+  id: 'office_capabilities',
+  description: 'Read the current runtime capability inventory instead of repeating outdated lists from chat history. Includes registered office tools and gateway features such as group-chat summaries. Available capability does not mean application/user permissions have been granted.',
+  inputSchema: z.object({}),
+  execute: async (_input, context): Promise<Record<string, unknown>> => {
+    const { agent } = await import('../agents/agent');
+    const registered = await agent.listTools({ requestContext: context.requestContext });
+    return {
+      tools: Object.entries(registered).map(([name, tool]) => ({ name, description: tool.description })),
+      businessOperations: businessSummaries(),
+      gatewayFeatures: ['群聊消息按本周、本月或日期范围总结', '授权后的指定私聊记录总结', '个人 @ 消息备份（需配置持有者）', '会议纪要提取待办', '用户授权、操作审批、消息撤回取消'],
+      apiCatalog: discoverApis(''),
+      permissionNote: '先检索并调用，依据真实返回区分应用权限、用户授权、资源访问范围和内网接口不支持；不能将未调用说成没有权限。',
+    };
+  },
+});
+
+export const officeBusinessTools = {
   readDocumentTool, readCalendarTool, readTaskTool,
   listCalendarsTool, readCalendarInfoTool, readCalendarEventTool, listTasksTool,
   createCalendarContainerTool, updateCalendarContainerTool, deleteCalendarContainerTool, deleteCalendarTool, deleteTaskTool,
@@ -202,3 +269,37 @@ export const officeTools = {
   createBitableRecordTool, updateBitableRecordTool,
   listDriveFolderTool, createDriveFolderTool, copyDriveFileTool, renameDriveFileTool, prepareReleaseMaterialsTool,
 };
+
+// One implementation per business operation. Old exports remain compatible for
+// workflows and existing Studio clients, but are not separate model tools.
+type Business = { id: string; name: string; description: string; schema: z.ZodObject<z.ZodRawShape>; execute: (input: unknown, context: unknown) => Promise<unknown> };
+const businessOperations = new Map<string, Business>(Object.entries(officeBusinessTools).map(([name, tool]) => [tool.id, {
+  id: tool.id, name, description: tool.description ?? '', schema: tool.inputSchema as z.ZodObject<z.ZodRawShape>,
+  execute: tool.execute as Business['execute'],
+}]));
+function businessSummaries() {
+  return [...businessOperations.values()].map(({ id, name, description }) => ({ id, name, description }));
+}
+function searchTerms(operation: Business) {
+  const id = operation.id;
+  return `${id} ${operation.name} ${operation.description} ${/calendar/.test(id) ? '日历 日程' : ''} ${/task/.test(id) ? '任务' : ''} ${/doc/.test(id) ? '文档' : ''} ${/table/.test(id) ? '表格 多维表格' : ''} ${/drive/.test(id) ? '云盘 文件 文件夹 管理' : ''} ${/message/.test(id) ? '消息 群聊 发送' : ''} ${/create/.test(id) ? '创建 新增' : ''} ${/update|rename/.test(id) ? '编辑 修改 更新' : ''} ${/read|list|inspect/.test(id) ? '读取 查询' : ''} ${/delete/.test(id) ? '删除' : ''}`.toLowerCase();
+}
+export function discoverOfficeOperations(query: string, operationId?: string, offset = 0) {
+  if (operationId) {
+    const business = businessOperations.get(operationId);
+    return business ? { operation: { id: business.id, description: business.description, input: z.toJSONSchema(business.schema), kind: 'business' }, note: '使用 office_call_api，arguments 直接填写此 schema；复用原业务服务及审批。' } : discoverApis(query, operationId, offset);
+  }
+  query = query.replace(/(创建|新增|添加|查询|查找|读取|编辑|修改|更新|删除|发送)(?:飞书)?(任务|日程|日历|文档|表格|云盘|消息|文件夹)/g, '$1 $2');
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = [...businessOperations.values()].filter(op => terms.every(term => searchTerms(op).includes(term)));
+  const raw = discoverApis(query, undefined, Math.max(0, offset - matches.length));
+  const business = matches.slice(offset, offset + 15).map(({ id, name, description }) => ({ id, name, description, kind: 'business' }));
+  const total = matches.length + (raw.total ?? 0);
+  return { total, hasMore: offset + 15 < total, nextOffset: offset + 15, operations: [...business, ...(raw.operations ?? []).slice(0, 15 - business.length)] };
+}
+export const agentOfficeTools = {
+  office_discover_apis: discoverFeishuApisTool, office_call_api: callFeishuApiTool,
+  office_recent_calendar_events: recentCalendarEventsTool, office_capabilities: capabilitiesTool,
+};
+// Keep legacy names registered for stored controller approvals and Studio clients.
+export const officeTools = { ...officeBusinessTools, discoverFeishuApisTool, callFeishuApiTool, recentCalendarEventsTool, capabilitiesTool, ...agentOfficeTools };

@@ -1,5 +1,6 @@
 import type { OfficeAction } from './actions';
 import { formatShanghaiTime } from './calendar-time';
+import { schedulingText } from './scheduling-text';
 
 type TaskWrite = Extract<OfficeAction, { kind: 'task_create' | 'task_update' }>;
 const dayMs = 86_400_000;
@@ -16,7 +17,7 @@ export function assertTaskTimeRange(action: { startTimestamp?: string; dueTimest
 // is trusted gateway context and must survive OAuth, including across midnight.
 export function reconcileTaskTime<T extends TaskWrite>(action: T, message: string, receivedAt: number): T {
   if (!Number.isFinite(receivedAt)) return action;
-  const scheduling = message.split(/[，,。；;\n]\s*(?:主题|标题|名称|说明|描述)\s*(?:是|为|[:：])/)[0];
+  const scheduling = schedulingText(message);
   const dates = [...scheduling.matchAll(/(\d{4})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])\s*(\d{1,2})\s*日?/g)];
   const relative = [...new Set(scheduling.match(/今天|明天|后天/g) ?? [])];
   let expectedDay: number;

@@ -63,6 +63,11 @@ async function initializeStateDb(): Promise<Client> {
     message_id TEXT PRIMARY KEY,
     seen_at INTEGER NOT NULL
   )`);
+  await db.execute(`CREATE TABLE IF NOT EXISTS schedule_sources (
+    requester_id TEXT NOT NULL, chat_id TEXT NOT NULL, message_id TEXT NOT NULL,
+    original_message TEXT NOT NULL, message_created_at INTEGER NOT NULL,
+    PRIMARY KEY(requester_id, chat_id)
+  )`);
   await db.execute(`CREATE TABLE IF NOT EXISTS recalled_messages (
     message_id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, recalled_at INTEGER NOT NULL
   )`);

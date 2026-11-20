@@ -6,6 +6,8 @@ import { getAction, isMessageRecalled, stateDb } from '../state/store';
 import { actionSummary, type OfficeAction } from './actions';
 import type { OfficeApi } from './client';
 import { assertTaskTimeRange, reconcileTaskTime } from './task-time';
+import { reconcileRelativeCalendarDate } from './calendar-time';
+import { prepareApiRequest, openApiScopes } from './openapi';
 import { authorizationScopes, authorizationUrl, exchangeCodeForUser, userAccessToken, UserAuthorizationRequiredError } from './user-auth';
 import { isResourceWrite, parseResourceIntent, prepareResourceWrite, readResource, requiredResourceScopes, resourceFamily, resourceMode, resourceReadSummary, ResourceAccessError, type ResourceIntent, type ResourceWrite } from './resource-operation';
 
@@ -18,9 +20,26 @@ export function setResourceContinuation(value: Continue | undefined) { continueR
 const ttl = 30 * 60_000;
 const scopeError = (error: unknown) => error instanceof UserAuthorizationRequiredError || /Feishu API (401|99991663|99991664|99991668|99991671|99991672|99991676|99991677|99991679)\b/.test(String(error));
 const accessError = (error: unknown) => error instanceof ResourceAccessError || /Feishu API (403|191002|193002|1470403)\b/.test(String(error));
+function expandApiScopes<T extends ResourceIntent>(intent: T, error: unknown): T | undefined {
+  if ((intent.kind !== 'openapi_read' && intent.kind !== 'openapi_write') || !scopeError(error)) return;
+  const scopes = (error as { requiredScopes?: string[] }).requiredScopes ?? [];
+  if (!scopes.length) return;
+  const current = openApiScopes(intent);
+  if (scopes.every(scope => current.includes(scope))) throw new Error(`已申请接口所需范围但仍被拒绝，请管理员核对应用权限是否开通并发布；不会重复要求相同授权。${String(error)}`);
+  return { ...intent, scopes: [...new Set([...intent.scopes, ...scopes])] };
+}
 function payload(row: Pending) { const data = JSON.parse(row.payload) as { intent: unknown; scopes: string[]; continuation?: ResourceContinuation }; return { intent: normalizeIntent(data.intent, data.continuation), scopes: data.scopes, continuation: data.continuation }; }
 function normalizeIntent(input: unknown, continuation?: ResourceContinuation): ResourceIntent {
   const intent = parseResourceIntent(input);
+  if (intent.kind === 'openapi_read' || intent.kind === 'openapi_write') {
+    const request = prepareApiRequest(intent);
+    if ((request.method === 'GET') !== (intent.kind === 'openapi_read')) throw new Error('接口读写类型与操作不符');
+  }
+  if (intent.kind === 'calendar_create' && continuation) return reconcileRelativeCalendarDate(intent, continuation.originalMessage, continuation.messageCreatedAt);
+  if (intent.kind === 'calendar_update' && continuation && intent.startTime && intent.endTime) {
+    const times = reconcileRelativeCalendarDate({ kind: 'calendar_create', summary: intent.summary ?? '编辑日程', startTime: intent.startTime, endTime: intent.endTime }, continuation.originalMessage, continuation.messageCreatedAt);
+    return { ...intent, startTime: times.startTime, endTime: times.endTime };
+  }
   if (intent.kind !== 'task_create' && intent.kind !== 'task_update') return intent;
   const normalized = continuation ? reconcileTaskTime(intent, continuation.originalMessage, continuation.messageCreatedAt) : intent;
   assertTaskTimeRange(normalized);
@@ -77,7 +96,7 @@ async function requestAuthorization(caller: Caller, intent: ResourceIntent, cont
   await db.execute({ sql: `INSERT INTO permission_requests(id,requester_id,chat_id,chat_type,payload,status,created_at,expires_at,origin_message_id)
     VALUES (?,?,?,?,?,'resource_approval',?,?,?)`, args: [id, caller.userId, caller.chatId, caller.chatType, JSON.stringify({ intent: selected, scopes, continuation }), Date.now(), Date.now() + ttl, caller.messageId ?? null] });
   try {
-    const proposal = await requestOfficeApproval(caller, { kind: 'resource_authorize', requestId: id, resource: resourceFamily(intent), summary: isResourceWrite(intent) ? actionSummary({ ...intent, permissionMode: 'user' }) : resourceReadSummary(intent) });
+    const proposal = await requestOfficeApproval(caller, { kind: 'resource_authorize', requestId: id, resource: resourceFamily(intent), summary: `${isResourceWrite(intent) ? actionSummary({ ...intent, permissionMode: 'user' }) : resourceReadSummary(intent)}\n申请范围：${scopes.join(' ')}` });
     return { ...proposal, status: 'authorization_required', requestId: id };
   } catch (error) {
     await db.execute({ sql: "UPDATE permission_requests SET status='resource_failed' WHERE id=?", args: [id] });
@@ -94,6 +113,11 @@ export async function requestResourceOperation(caller: Caller, input: ResourceIn
     if (mode === 'user' && !token) return requestAuthorization(caller, intent, continuation);
     return await perform(caller, intent, token ?? undefined);
   } catch (error) {
+    if (intent.kind === 'openapi_read' || intent.kind === 'openapi_write') {
+      if (mode === 'app' && (scopeError(error) || accessError(error))) throw new Error(`应用身份权限不足，请管理员开通并发布接口权限及数据范围；用户 OAuth 不能代替应用授权。${String(error)}`);
+      const expanded = expandApiScopes(intent, error);
+      if (expanded) return requestAuthorization(caller, expanded, continuation);
+    }
     if (scopeError(error) || (mode === 'app' && accessError(error))) return requestAuthorization(caller, intent, continuation);
     if (accessError(error)) throw new ResourceAccessError('当前用户没有目标日历或任务的操作权限，请联系所有者授权后重新发起；OAuth 不能授予资源协作权限');
     throw error;
@@ -121,6 +145,11 @@ export async function executeResourceWrite(caller: Caller, action: ResourceWrite
     if (mode === 'user' && !token) return requestAuthorization(caller, action);
     return await api.execute(action, executionKey, token ?? undefined, caller.userId);
   } catch (error) {
+    if (action.kind === 'openapi_write') {
+      if (mode === 'app' && (scopeError(error) || accessError(error))) throw new Error(`应用身份权限不足，请管理员开通并发布接口权限及数据范围。${String(error)}`);
+      const expanded = expandApiScopes(action, error);
+      if (expanded) return requestAuthorization(caller, expanded);
+    }
     // Only explicit permission rejections can start authorization. Timeouts or
     // other ambiguous write outcomes must remain failed and are never replayed.
     if (scopeError(error) || (mode === 'app' && accessError(error))) return requestAuthorization(caller, action);
@@ -165,6 +194,18 @@ export async function completeResourceAuthorization(state: string, code: string)
       await sendOfficeText(caller.chatId, `${isResourceWrite(intent) ? '操作' : resourceReadSummary(intent)}结果：\n${text.slice(0, 10_000)}${suffix}`);
     }
   } catch (error) {
+    // A read may reveal additional scopes only after the first OAuth grant.
+    // Keep the original caller/message while asking for that incremental grant.
+    try {
+      const saved = payload(row);
+      const expanded = expandApiScopes(saved.intent, error);
+      if (expanded) {
+        await ensureResumable(row);
+        await requestAuthorization(caller, expanded, saved.continuation);
+        await db.execute({ sql: "UPDATE permission_requests SET status='superseded' WHERE id=? AND status='resource_auth_processing'", args: [state] });
+        return;
+      }
+    } catch (expandedError) { error = expandedError; }
     await db.execute({ sql: "UPDATE permission_requests SET status='resource_failed' WHERE id=? AND status='resource_auth_processing'", args: [state] });
     const current = (await db.execute({ sql: 'SELECT status FROM permission_requests WHERE id=?', args: [state] })).rows[0];
     if (current?.status !== 'cancelled' && !(await isMessageRecalled(caller.messageId))) await sendOfficeText(caller.chatId, accessError(error)

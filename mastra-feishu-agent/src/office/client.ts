@@ -2,6 +2,7 @@ import { withUserAccessToken, type Client, type LarkChannel } from '@larksuiteoa
 import { config } from '../config';
 import type { OfficeAction } from './actions';
 import { assertTaskTimeRange } from './task-time';
+import { executeOpenApi } from './openapi';
 import { TableService } from './table-service';
 import { ReleaseMaterialsService } from './release-materials';
 
@@ -29,7 +30,7 @@ function safeEndpoint(url: string): string {
 function apiError(request: ApiRequest, result: ApiResult): Error {
   const violations = result.error?.field_violations?.map(v => `${v.field ?? 'field'}: ${v.description ?? 'invalid'}`).join('; ');
   const details = [`params=${Object.keys(request.params ?? {}).join(',') || 'none'}`, violations, result.error?.log_id && `log_id=${result.error.log_id}`].filter(Boolean).join('; ');
-  return new Error(`Feishu API ${result.code}: ${result.msg || 'request failed'} [${request.method} ${safeEndpoint(request.url)}${details ? `; ${details}` : ''}]`);
+  return Object.assign(new Error(`Feishu API ${result.code}: ${result.msg || 'request failed'} [${request.method} ${safeEndpoint(request.url)}${details ? `; ${details}` : ''}]`), { requiredScopes: [...new Set(result.msg?.match(/\b[a-z][a-z0-9_.-]*:[a-z0-9_:.-]+/g) ?? [])].filter(scope => !scope.startsWith('http:') && !scope.startsWith('https:')).map(scope => scope.replace(/[.]+$/, '')) });
 }
 
 export class OfficeApi {
@@ -107,6 +108,7 @@ export class OfficeApi {
     if ('permissionMode' in action && action.permissionMode === 'user' && !userAccessToken) throw new Error('缺少请求者的用户授权，请重新授权后继续');
     const selectedToken = 'permissionMode' in action && action.permissionMode === 'user' ? userAccessToken : undefined;
     switch (action.kind) {
+      case 'openapi_write': return executeOpenApi(this, action, selectedToken);
       case 'resource_authorize': throw new Error('用户授权必须由审批网关处理');
       case 'calendar_container_create':
         return this.api({ method: 'POST', url: '/open-apis/calendar/v4/calendars', userAccessToken: selectedToken, data: { summary: action.summary, description: action.description, permissions: action.permissions } });

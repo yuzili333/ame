@@ -1,4 +1,6 @@
 import type { OfficeAction } from './actions';
+import { explicitClockRange } from './clock-range';
+import { schedulingText } from './scheduling-text';
 
 type CalendarCreate = Extract<OfficeAction, { kind: 'calendar_create' }>;
 
@@ -24,6 +26,10 @@ export function formatShanghaiTime(timestamp: string): string {
 
 export function reconcileRelativeCalendarDate(action: CalendarCreate, message: string, receivedAt: number): CalendarCreate {
   if (!Number.isFinite(receivedAt)) return action;
+  message = schedulingText(message);
+  // Multiple explicit dates describe a potentially cross-day range; do not
+  // collapse it into a single day with the simple clock parser.
+  if ((message.match(/\d{4}\s*(?:年|[-/.])\s*\d{1,2}\s*(?:月|[-/.])\s*\d{1,2}/g) ?? []).length > 1) return action;
   const explicitDate = /(\d{4})\s*(?:年|[-/.])\s*(\d{1,2})\s*(?:月|[-/.])\s*(\d{1,2})\s*日?/.exec(message);
   const relativeDays: Record<string, number> = { 今天: 0, 明天: 1, 后天: 2 };
   const relativeWords = [...new Set(message.match(/今天|明天|后天/g) ?? [])];
@@ -39,8 +45,12 @@ export function reconcileRelativeCalendarDate(action: CalendarCreate, message: s
   }
   const actualDay = localDayNumber(Number(action.startTime) * 1000);
   const dayDelta = expectedDay - actualDay;
-  if (!dayDelta) return action;
   const secondsDelta = dayDelta * 86_400;
+  const clocks = explicitClockRange(message);
+  if (clocks) {
+    const midnight = expectedDay * 86_400 - 8 * 3600;
+    return { ...action, startTime: String(midnight + clocks[0] * 60), endTime: String(midnight + clocks[1] * 60) };
+  }
   return {
     ...action,
     startTime: String(Number(action.startTime) + secondsDelta),

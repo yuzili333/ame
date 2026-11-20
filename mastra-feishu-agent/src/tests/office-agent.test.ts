@@ -26,6 +26,46 @@ beforeAll(async () => {
 
 const dm = { userId: 'u1', chatId: 'dm1', chatType: 'p2p' as const };
 
+it.each([
+  ['pending', false, 0], ['succeeded', false, 0], ['denied', false, 0], ['failed', true, 0], ['failed', false, 1],
+] as const)('keeps card status authoritative but reports delivery failure: %s, delivered=%s', async (status, delivered, count) => {
+  const { FeishuGateway } = await import('../gateway/gateway');
+  const sent: unknown[] = [];
+  const gateway = new FeishuGateway({ rawClient: {}, send: async (_chat: string, message: unknown) => { sent.push(message); return {}; } } as unknown as LarkChannel);
+  const caller = { ...dm, messageId: `calendar-reply-${status}-${delivered}` };
+  let subscriber: (event: unknown) => void = () => {};
+  Reflect.get(gateway, 'sessions').set(identity.memoryKeys(caller).sessionId, {
+    subscribe: (callback: typeof subscriber) => { subscriber = callback; return () => {}; },
+    sendMessage: async () => {
+      const action = await approvals.proposeAction(caller, { kind: 'calendar_create', summary: 'xxx', calendarId: 'cal', startTime: '1795168800', endTime: '1795172400' });
+      await (await store.stateDb()).execute({ sql: 'UPDATE actions SET status=?,card_message_id=? WHERE id=?', args: [status, delivered ? 'card-id' : null, action.id] });
+      subscriber({ type: 'message_update', event: { type: 'text-delta', delta: count ? '审批卡片发送失败，未执行创建' : '已为您发起日程创建请求，审批卡片已发送，请您确认' } });
+      subscriber({ type: 'agent_end', reason: 'completed' });
+    },
+  });
+  await Reflect.get(gateway, 'runAgent').call(gateway, '创建日程', caller, caller.messageId);
+  await vi.waitFor(() => expect(Reflect.get(gateway, 'activeRuns').size).toBe(0));
+  expect(sent).toHaveLength(count);
+  if (count) expect(sent[0]).toEqual({ markdown: '审批卡片发送失败，未执行创建' });
+});
+
+it('requires catalog discovery on the first step of a Feishu task request', async () => {
+  const { agent } = await import('../mastra/agents/agent');
+  const { RequestContext } = await import('@mastra/core/request-context');
+  const requestContext = new RequestContext();
+  requestContext.set('originalMessage', '创建一个任务，主题是xxx，时间为今天18:00-19:00');
+  const options = await agent.getDefaultOptions({ requestContext });
+  expect(options.prepareStep).toBeTypeOf('function');
+  const step = options.prepareStep!;
+  expect(await step({ stepNumber: 0 } as Parameters<typeof step>[0])).toMatchObject({ toolChoice: { type: 'tool', toolName: 'office_discover_apis' } });
+  expect(await step({ stepNumber: 1 } as Parameters<typeof step>[0])).toBeUndefined();
+  requestContext.set('officeCatalogDiscovered', true);
+  expect(await step({ stepNumber: 0 } as Parameters<typeof step>[0])).toBeUndefined();
+  requestContext.set('originalMessage', '你好');
+  const casual = await agent.getDefaultOptions({ requestContext });
+  expect(await casual.prepareStep?.({ stepNumber: 0 } as Parameters<typeof step>[0])).toBeUndefined();
+});
+
 describe('Feishu admission and memory isolation', () => {
   it('allows group members to mention the bot without a user allowlist entry', () => {
     const base = { senderId: 'u1', chatId: 'g1', chatType: 'group' as const, mentionedBot: true };

@@ -4,6 +4,10 @@ import { reconcileTaskTime } from '../office/task-time';
 const ms = (local: string) => String(Date.parse(`${local}+08:00`));
 const receivedAt = Number(ms('2026-11-17T00:05:00'));
 const action = { kind: 'task_create' as const, summary: 'Work', dueTimestamp: ms('2026-10-26T17:00:00') };
+it('extracts task dates and clocks after the title field', () => {
+  expect(reconcileTaskTime(action, '创建一个任务，主题是明天的复盘，时间为今天18:00-19:00', receivedAt))
+    .toMatchObject({ startTimestamp: ms('2026-11-17T18:00:00'), dueTimestamp: ms('2026-11-17T19:00:00') });
+});
 
 it.each([
   ['今天下午16:00-17:00', '2026-11-17'],

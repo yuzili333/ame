@@ -6,10 +6,12 @@
   "private": true,
   "scripts": {
     "dev": "node --env-file=.env ./scripts/mastra-cli.mjs dev",
+    "prebuild": "npm run generate:feishu-catalog",
     "build": "node --env-file=.env ./scripts/mastra-cli.mjs build",
     "start": "node --env-file=.env ./scripts/mastra-cli.mjs start",
     "gateway": "tsx src/gateway/main.ts",
     "migrate:traces": "node ./scripts/migrate-traces.mjs",
+    "generate:feishu-catalog": "node scripts/generate-feishu-catalog.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

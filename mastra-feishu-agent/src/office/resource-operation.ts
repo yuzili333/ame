@@ -2,12 +2,14 @@ import { z } from 'zod';
 import { officeAction, type OfficeAction } from './actions';
 import type { OfficeApi } from './client';
 import { assertTaskTimeRange } from './task-time';
+import { openApiFields, openApiScopes, prepareApiRequest, executeOpenApi } from './openapi';
 
 const token = z.string().min(1).max(256).regex(/^[\w@.-]+$/);
 const timestamp = z.string().regex(/^\d{10}$/);
 const identity = z.enum(['user', 'app']).optional();
 const page = { pageToken: z.string().min(1).max(4096).optional(), pageSize: z.number().int().min(1).max(100).optional() };
 export const resourceRead = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('openapi_read'), ...openApiFields }),
   z.object({ kind: z.literal('calendar_list'), permissionMode: identity, ...page }),
   z.object({ kind: z.literal('calendar_read'), calendarId: token.optional(), permissionMode: identity }),
   z.object({ kind: z.literal('calendar_events'), calendarId: token.optional(), startTime: timestamp, endTime: timestamp, pageToken: page.pageToken, permissionMode: identity }),
@@ -16,10 +18,10 @@ export const resourceRead = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('task_read'), taskId: token }),
 ]);
 export type ResourceRead = z.infer<typeof resourceRead>;
-export type ResourceWrite = Extract<OfficeAction, { kind: `calendar_${string}` | `task_${string}` }>;
+export type ResourceWrite = Extract<OfficeAction, { kind: `calendar_${string}` | `task_${string}` | 'openapi_write' }>;
 export type ResourceIntent = ResourceRead | ResourceWrite;
 export function isResourceWrite(action: { kind: string }): action is ResourceWrite {
-  return ['calendar_create', 'calendar_update', 'calendar_delete', 'calendar_container_create', 'calendar_container_update', 'calendar_container_delete', 'task_create', 'task_update', 'task_delete'].includes(action.kind);
+  return ['openapi_write', 'calendar_create', 'calendar_update', 'calendar_delete', 'calendar_container_create', 'calendar_container_update', 'calendar_container_delete', 'task_create', 'task_update', 'task_delete'].includes(action.kind);
 }
 export function parseResourceIntent(input: unknown): ResourceIntent {
   const read = resourceRead.safeParse(input);
@@ -28,9 +30,10 @@ export function parseResourceIntent(input: unknown): ResourceIntent {
   if (!isResourceWrite(action)) throw new Error('不是日历或任务操作');
   return action;
 }
-export const resourceFamily = (intent: ResourceIntent) => intent.kind.startsWith('task_') ? 'task' as const : 'calendar' as const;
+export const resourceFamily = (intent: ResourceIntent) => intent.kind.startsWith('openapi_') ? 'openapi' as const : intent.kind.startsWith('task_') ? 'task' as const : 'calendar' as const;
 export const resourceMode = (intent: ResourceIntent): 'app' | 'user' => 'permissionMode' in intent && intent.permissionMode === 'app' ? 'app' : 'user';
 export function requiredResourceScopes(intent: ResourceIntent): string[] {
+  if (intent.kind === 'openapi_read' || intent.kind === 'openapi_write') return openApiScopes(intent);
   if (resourceFamily(intent) === 'task') return [isResourceWrite(intent) ? 'task:task:write' : 'task:task:read', 'offline_access'];
   return isResourceWrite(intent) ? ['calendar:calendar', 'calendar:calendar:readonly', 'offline_access'] : ['calendar:calendar:readonly', 'offline_access'];
 }
@@ -44,6 +47,10 @@ export async function calendarInfo(api: OfficeApi, calendarId: string, userAcces
 
 export async function prepareResourceWrite(api: OfficeApi, input: ResourceWrite, userAccessToken?: string): Promise<ResourceWrite> {
   let action = { ...input, permissionMode: resourceMode(input) } as ResourceWrite;
+  if (action.kind === 'openapi_write') {
+    if (prepareApiRequest(action).method === 'GET') throw new Error('读取接口不能伪装成写入操作');
+    return action;
+  }
   if (action.kind.startsWith('calendar_')) {
     if (action.kind === 'calendar_container_create') return action;
     if (action.kind === 'calendar_create' && !action.calendarId) {
@@ -87,6 +94,10 @@ export async function readResource(api: OfficeApi, intent: ResourceRead, userAcc
   const pagination = 'pageSize' in intent || 'pageToken' in intent
     ? { page_size: 'pageSize' in intent ? intent.pageSize ?? 50 : 50, ...('pageToken' in intent && intent.pageToken ? { page_token: intent.pageToken } : {}) } : {};
   switch (intent.kind) {
+    case 'openapi_read': {
+      if (prepareApiRequest(intent).method !== 'GET') throw new Error('写入接口必须发起操作审批');
+      return executeOpenApi(api, intent, userAccessToken);
+    }
     case 'task_list':
       return api.call({ method: 'GET', url: '/open-apis/task/v2/tasks', userAccessToken, params: { type: 'my_tasks', ...pagination, ...(intent.completed !== undefined ? { completed: intent.completed } : {}) } });
     case 'task_read': return api.readTask(intent.taskId, userAccessToken);
@@ -105,6 +116,7 @@ export async function readResource(api: OfficeApi, intent: ResourceRead, userAcc
 
 export function resourceReadSummary(intent: ResourceRead): string {
   switch (intent.kind) {
+    case 'openapi_read': return intent.summary;
     case 'calendar_list': return '查询日历列表';
     case 'calendar_read': return `查询日历 ${intent.calendarId ?? '个人主日历'}`;
     case 'calendar_events': return `查询日历 ${intent.calendarId ?? '个人主日历'} 的日程`;

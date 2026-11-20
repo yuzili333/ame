@@ -28,6 +28,7 @@ import { safeSdkLogger } from './safe-sdk-logger';
 import { parseSummaryRequest, type SummaryRequest } from './summary-range';
 import { readHistory, summarizeHistory } from './chat-summary';
 import { backupMention, recoverMentionBackups } from './mention-watch';
+import { resolveScheduleSource } from '../office/schedule-followup';
 
 type Session = Awaited<ReturnType<typeof controller.createSession>>;
 const minutesCommand = /^\/minutes\s+([\w@.-]+)\s*$/i;
@@ -596,6 +597,16 @@ export class FeishuGateway {
   }
 
   private async runAgent(content: string, caller: Caller, replyTo: string, messageCreatedAt = Date.now(), freshTableRetry = false, authorizedReadResult?: string) {
+    if (!Number.isFinite(messageCreatedAt) || messageCreatedAt <= 0) messageCreatedAt = Date.now();
+    const source = authorizedReadResult === undefined
+      ? await resolveScheduleSource(caller, content, messageCreatedAt)
+      : { originalMessage: content, messageCreatedAt, needsTime: false };
+    if (source.needsTime) {
+      await this.channel.send(caller.chatId, { text: '未找到可沿用的近期原始时间，请补充这次日程或任务的日期、开始和结束时间。' }, { replyTo });
+      return;
+    }
+    content = source.originalMessage;
+    messageCreatedAt = source.messageCreatedAt;
     const session = await this.sessionFor(caller);
     const permissionRequestBefore = await latestPermissionRequestId(caller);
     const sessionId = memoryKeys(caller).sessionId;
@@ -610,6 +621,13 @@ export class FeishuGateway {
       try {
         if (sendReply && !cancelled && !(await isMessageRecalled(replyTo)) && reply.trim() && await latestPermissionRequestId(caller) === permissionRequestBefore) {
           let outgoing = reply;
+          // Office cards own the operation's status. The user may approve while
+          // the model is still generating; never replay its stale "pending" text.
+          const officeActions = await (await stateDb()).execute({
+            sql: "SELECT id FROM actions WHERE origin_message_id=? AND requester_id=? AND chat_id=? AND kind!='mastra_tool' AND (status!='failed' OR card_message_id IS NOT NULL) LIMIT 1",
+            args: [caller.messageId ?? replyTo, caller.userId, caller.chatId],
+          });
+          if (officeActions.rows.length) outgoing = '';
           const latestRelease = await this.latestReleaseJob(caller);
           if (latestRelease?.originMessageId === replyTo && latestRelease.approvalId) {
             outgoing = '';
